@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 
 from signals.signals_functions import (
@@ -7,8 +6,7 @@ from signals.signals_functions import (
     apply_vol_signal,
 )
 
-W_BASE       = np.array([0.70, 0.15, 0.15])
-TRADING_DAYS = 252
+from config import W_BASE
 
 
 def compute_signals(garch_results, labels):

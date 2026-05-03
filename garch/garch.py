@@ -3,9 +3,7 @@ import pandas as pd
 from tqdm import tqdm
 
 from garch.garch_functions import get_quarter_ends, fit_gjr_garch, build_covariance
-
-ROLL_GARCH = 252
-ROLL_CORR  = 63
+from config import ROLL_GARCH, ROLL_CORR
 
 
 def rolling_garch_and_corr(log_ret, labels):

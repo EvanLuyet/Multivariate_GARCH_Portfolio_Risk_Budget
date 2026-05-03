@@ -1,13 +1,14 @@
+import os
+import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-VOL_LOW    = 0.10
-VOL_HIGH   = 0.14
-VOL_TARGET = 0.12
-OUTPUT     = "results/portfolio_risk_budget.png"
+from config import VOL_LOW, VOL_HIGH, VOL_TARGET
+
+OUTPUT = "results/portfolio_risk_budget.png"
 
 _COLORS = {"BUY": "#2ecc71", "HOLD": "#3498db", "SELL": "#e74c3c"}
 _ASSET_COLORS = ["#2c3e50", "#3498db", "#e67e22"]
@@ -24,10 +25,12 @@ def make_plots(sig_df, strat_ret, bench_ret, labels):
     col_rc    = [f"rc_{l.lower()}" for l in labels]
     col_w     = [f"w_{l.lower()}"  for l in labels]
 
+    os.makedirs("results", exist_ok=True)
+
     # ── Plot 1: Cumulative Returns ──────────────────────────────────────────────
     ax = axes[0]
-    cum_strat = (1 + strat_ret).cumprod()
-    cum_bench = (1 + bench_ret).cumprod()
+    cum_strat = np.exp(strat_ret).cumprod()
+    cum_bench = np.exp(bench_ret).cumprod()
     ax.semilogy(cum_strat.index, cum_strat.values, label="Dynamic Strategy",
                 color="#2c3e50", lw=1.8)
     ax.semilogy(cum_bench.index, cum_bench.values, label="Static 70/15/15",
