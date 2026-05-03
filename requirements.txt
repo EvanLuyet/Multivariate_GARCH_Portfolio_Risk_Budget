@@ -1,0 +1,7 @@
+arch
+matplotlib
+numpy
+pandas
+scipy
+tqdm
+yfinance
