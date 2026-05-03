@@ -1,7 +1,8 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-from data.data import fetch_data, LABELS
+from config import LABELS
+from data.data import fetch_data
 from garch.garch import rolling_garch_and_corr
 from signals.signals import compute_signals, print_signal_table
 from backtest.backtest import run_backtest, print_performance

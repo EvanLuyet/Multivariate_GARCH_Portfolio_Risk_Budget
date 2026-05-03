@@ -1,8 +1,7 @@
 import numpy as np
 import yfinance as yf
 
-TICKERS = ["^GSPC", "QQQ", "EZU"]
-LABELS  = ["S&P",   "NDX", "EUR"]
+from config import TICKERS, LABELS
 
 
 def fetch_data():

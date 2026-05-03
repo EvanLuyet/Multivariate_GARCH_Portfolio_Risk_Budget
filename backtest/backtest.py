@@ -2,9 +2,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.backtest_functions import perf, vol_target_hit_rate
-
-W_BASE       = np.array([0.70, 0.15, 0.15])
-TRADING_DAYS = 252
+from config import W_BASE, TRADING_DAYS
 
 
 def run_backtest(sig_df, log_ret, labels):
@@ -26,8 +24,9 @@ def run_backtest(sig_df, log_ret, labels):
         if period.empty:
             continue
 
-        strat_ret.append(pd.Series(period.values @ w_vec,     index=period.index))
-        bench_ret.append(pd.Series(period.values @ W_BASE,    index=period.index))
+        simple = np.exp(period.values) - 1
+        strat_ret.append(pd.Series(np.log1p(simple @ w_vec),   index=period.index))
+        bench_ret.append(pd.Series(np.log1p(simple @ W_BASE),  index=period.index))
 
     strat_ret = pd.concat(strat_ret).sort_index()
     bench_ret = pd.concat(bench_ret).sort_index()
@@ -51,7 +50,8 @@ def print_performance(sig_df, log_ret, strat_ret, bench_ret, labels):
         period = log_ret.loc[mask, labels]
         if len(period) < 5:
             continue
-        r_vol = (period.values @ w_vec).std() * np.sqrt(TRADING_DAYS)
+        simple = np.exp(period.values) - 1
+        r_vol  = (simple @ w_vec).std() * np.sqrt(TRADING_DAYS)
         q_vols.append(r_vol)
 
     hit_rate = vol_target_hit_rate(q_vols)

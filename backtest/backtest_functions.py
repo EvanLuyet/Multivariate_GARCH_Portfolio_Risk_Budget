@@ -1,16 +1,14 @@
 import numpy as np
 
-TRADING_DAYS = 252
-RF           = 0.02
-VOL_TARGET   = 0.12
+from config import TRADING_DAYS, RF, VOL_TARGET
 
 
 def perf(r):
-    """Return (ann_return, ann_vol, sharpe, max_drawdown) for a daily return series."""
-    ann_ret  = r.mean() * TRADING_DAYS
-    ann_vol  = r.std()  * np.sqrt(TRADING_DAYS)
+    """Return (ann_return, ann_vol, sharpe, max_drawdown) for a daily log-return series."""
+    ann_ret  = np.exp(r.mean() * TRADING_DAYS) - 1   # geometric annualized return
+    ann_vol  = r.std() * np.sqrt(TRADING_DAYS)
     sharpe   = (ann_ret - RF) / ann_vol if ann_vol > 0 else float("nan")
-    cum      = (1 + r).cumprod()
+    cum      = np.exp(r).cumprod()                    # exact for log returns
     roll_max = cum.cummax()
     mdd      = ((cum - roll_max) / roll_max).min()
     return ann_ret, ann_vol, sharpe, mdd
