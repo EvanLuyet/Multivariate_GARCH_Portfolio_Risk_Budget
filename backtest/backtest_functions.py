@@ -1,6 +1,6 @@
 import numpy as np
 
-from config import TRADING_DAYS, RF, VOL_TARGET
+from portfolio_config import TRADING_DAYS, RF, VOL_TARGET
 
 
 def perf(r):

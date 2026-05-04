@@ -1,7 +1,7 @@
 import numpy as np
 import yfinance as yf
 
-from config import TICKERS, LABELS
+from portfolio_config import TICKERS, LABELS
 
 
 def fetch_data():

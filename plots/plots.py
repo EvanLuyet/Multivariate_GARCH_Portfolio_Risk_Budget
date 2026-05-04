@@ -6,7 +6,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-from config import VOL_LOW, VOL_HIGH, VOL_TARGET
+from portfolio_config import VOL_LOW, VOL_HIGH, VOL_TARGET
 
 OUTPUT = "results/portfolio_risk_budget.png"
 

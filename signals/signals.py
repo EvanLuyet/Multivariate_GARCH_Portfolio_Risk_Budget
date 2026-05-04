@@ -6,7 +6,7 @@ from signals.signals_functions import (
     apply_vol_signal,
 )
 
-from config import W_BASE
+from portfolio_config import W_BASE
 
 
 def compute_signals(garch_results, labels):
