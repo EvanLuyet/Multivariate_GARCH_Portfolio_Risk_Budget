@@ -1,9 +1,13 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
 from garch.garch_functions import get_quarter_ends, fit_gjr_garch, build_covariance
-from config import ROLL_GARCH, ROLL_CORR
+from portfolio_config import ROLL_GARCH, ROLL_CORR
 
 
 def rolling_garch_and_corr(log_ret, labels):

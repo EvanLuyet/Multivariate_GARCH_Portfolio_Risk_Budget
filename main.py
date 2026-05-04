@@ -1,7 +1,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-from config import LABELS
+from portfolio_config import LABELS
 from data.data import fetch_data
 from garch.garch import rolling_garch_and_corr
 from signals.signals import compute_signals, print_signal_table

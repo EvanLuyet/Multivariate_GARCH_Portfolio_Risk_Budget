@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd
 
 from signals.signals_functions import (
@@ -6,7 +10,7 @@ from signals.signals_functions import (
     apply_vol_signal,
 )
 
-from config import W_BASE
+from portfolio_config import W_BASE
 
 
 def compute_signals(garch_results, labels):

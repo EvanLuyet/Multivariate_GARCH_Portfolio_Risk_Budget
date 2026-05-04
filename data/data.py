@@ -1,7 +1,11 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import yfinance as yf
 
-from config import TICKERS, LABELS
+from portfolio_config import TICKERS, LABELS
 
 
 def fetch_data():

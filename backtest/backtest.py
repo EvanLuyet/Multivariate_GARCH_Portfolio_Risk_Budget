@@ -1,8 +1,12 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import pandas as pd
 
 from backtest.backtest_functions import perf, vol_target_hit_rate
-from config import W_BASE, TRADING_DAYS
+from portfolio_config import W_BASE, TRADING_DAYS
 
 
 def run_backtest(sig_df, log_ret, labels):
