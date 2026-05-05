@@ -20,7 +20,7 @@ from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
-from config import ASSETS, BASE_WEIGHTS, STATE_FILE
+from config import ASSETS, BASE_WEIGHTS, STATE_FILE, MODEL_CACHE_DIR
 
 from data.fetcher                     import fetch_data
 from layer1_garch.garch_model         import run_garch
@@ -56,10 +56,23 @@ def save_state(weights: dict) -> None:
     print(f'State saved → {STATE_FILE}')
 
 
+def _clear_model_cache() -> None:
+    """Delete all joblib model cache files so every layer re-fits from scratch."""
+    cache_dir = Path(MODEL_CACHE_DIR)
+    if cache_dir.exists():
+        deleted = list(cache_dir.glob('*.joblib'))
+        for f in deleted:
+            f.unlink()
+        print(f'Model cache cleared ({len(deleted)} file(s) removed).')
+
+
 def run(force_refresh: bool = False) -> None:
     print('\n' + '=' * 56)
     print('  PORTFOLIO INTELLIGENCE ENGINE')
     print('=' * 56 + '\n')
+
+    if force_refresh:
+        _clear_model_cache()
 
     # ── Load previous state ────────────────────────────────────────────────────
     current_weights = load_state()
