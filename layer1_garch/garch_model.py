@@ -159,6 +159,42 @@ def run_garch(data: pd.DataFrame, weights: dict) -> dict:
     return history
 
 
+def get_daily_garch_vols(data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fit GJR-GARCH once on the full historical series for each asset and
+    return a DataFrame of daily annualized conditional volatilities.
+
+    This is intentionally a single in-sample fit (not rolling) because its
+    sole purpose is to provide a smooth daily vol proxy for the HMM feature
+    matrix. Using the full series maximises the number of daily observations
+    available to the HMM — the key insight behind this function.
+
+    The rolling quarterly fits in run_garch() remain the source of truth for
+    vol forecasting and covariance estimation in the BL optimizer.
+    """
+    cache_dir  = Path(MODEL_CACHE_DIR)
+    cache_dir.mkdir(exist_ok=True)
+    cache_file = cache_dir / f'daily_garch_vols_{datetime.today().strftime("%Y%m%d")}.joblib'
+
+    if cache_file.exists():
+        return joblib.load(cache_file)
+
+    print('Layer 1 — Fitting full-sample GJR-GARCH for daily vol series …')
+    result = {}
+    for asset in ASSETS:
+        series  = data[f'ret_{asset}'].values
+        am      = arch_model(series * 100, vol='GARCH', p=1, o=1, q=1,
+                             dist='t', mean='Zero')
+        res     = am.fit(disp='off', show_warning=False)
+        cond_d  = np.sqrt(res.conditional_volatility) / 100   # daily sigma
+        cond_a  = cond_d * np.sqrt(TRADING_DAYS)              # annualized
+        result[f'garch_vol_{asset}'] = pd.Series(cond_a, index=data.index)
+
+    df = pd.DataFrame(result).dropna()
+    joblib.dump(df, cache_file)
+    return df
+
+
 if __name__ == '__main__':
     from data.fetcher import fetch_data
 
