@@ -106,8 +106,10 @@ def fetch_data(force_refresh: bool = False) -> pd.DataFrame:
             s = _fetch_fred_series(series_id, start_str, end_str)
         else:
             s = pd.Series(dtype=float, name=series_id)
-        # Reindex to equity trading calendar, forward-fill gaps
-        df[col_name] = s.reindex(df.index, method='ffill')
+        # Reindex to equity trading calendar, forward-fill gaps.
+        # Skip reindex on empty series (e.g. no FRED_API_KEY) — index dtypes
+        # would be incompatible (int64 vs datetime64) and raise TypeError.
+        df[col_name] = s.reindex(df.index, method='ffill') if not s.empty else np.nan
 
     # ── Cache ──────────────────────────────────────────────────────────────────
     Path(CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
