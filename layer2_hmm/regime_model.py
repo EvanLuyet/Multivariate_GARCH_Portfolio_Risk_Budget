@@ -27,7 +27,7 @@ from sklearn.preprocessing import StandardScaler
 warnings.filterwarnings('ignore')
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import ASSETS, HMM_STATES, RANDOM_SEED, MODEL_CACHE_DIR, TRADING_DAYS
+from config import ASSETS, HMM_STATES, HMM_PROB_FLOOR, RANDOM_SEED, MODEL_CACHE_DIR, TRADING_DAYS
 
 REGIME_LABELS = {0: '🟢 Bull', 1: '🟡 Transition', 2: '🔴 Crisis'}
 REGIME_COLORS = {0: '#2ecc71', 1: '#f39c12', 2: '#e74c3c'}
@@ -139,6 +139,16 @@ def run_hmm(garch_history: dict, data: pd.DataFrame) -> dict:
     remap    = {old: new for new, old in enumerate(order)}
     states   = np.array([remap[s] for s in raw_states])
     probs    = state_probs[:, order]            # reorder columns to match
+
+    # ── Probability floor (label smoothing) ───────────────────────────────────
+    # Gaussian HMMs can produce degenerate [1, 0, 0] posteriors when the
+    # current observation sits deep inside one cluster — a direct consequence
+    # of limited training data and well-separated Gaussians. A floor of 5%
+    # per regime preserves the uncertainty signal that makes regime probs
+    # useful for BL blending and prevents the crisis weight from collapsing
+    # to zero in seemingly calm periods.
+    probs      = np.clip(probs, HMM_PROB_FLOOR, 1.0)
+    probs      = probs / probs.sum(axis=1, keepdims=True)   # renormalize rows
 
     regime_series = pd.Series(states, index=feat_df.index, name='regime')
     probs_df      = pd.DataFrame(

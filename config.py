@@ -29,6 +29,7 @@ LAMBDA_TC        = 0.001    # TC penalty weight inside BL optimizer
 GARCH_WINDOW   = 252
 CORR_WINDOW    = 63
 HMM_STATES     = 3
+HMM_PROB_FLOOR = 0.05   # minimum probability per regime — prevents degenerate [1,0,0] posteriors
 LOOKBACK_YEARS = 10
 REBALANCE_FREQ = 'Q'
 TRADING_DAYS   = 252
