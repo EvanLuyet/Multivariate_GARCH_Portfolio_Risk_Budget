@@ -122,11 +122,25 @@ def run_hmm(garch_history: dict, data: pd.DataFrame) -> dict:
     print(f'Layer 2 — HMM training on {n_obs} daily observations '
           f'({feat_df.index[0].date()} → {feat_df.index[-1].date()}) …')
 
-    # ── Fit or load ────────────────────────────────────────────────────────────
+    # ── Fit or load — validate feature count before trusting cache ────────────
+    n_features = X_scaled.shape[1]
+    cache_valid = False
     if cache_file.exists():
-        model, scaler = joblib.load(cache_file)
-        print('Layer 2 — Loading HMM from cache …')
-    else:
+        try:
+            model, scaler = joblib.load(cache_file)
+            # A model trained on a different number of features will crash on
+            # predict(); check means_ shape before accepting the cache.
+            if model.means_.shape[1] == n_features:
+                print('Layer 2 — Loading HMM from cache …')
+                cache_valid = True
+            else:
+                print(f'Layer 2 — Cache feature mismatch '
+                      f'({model.means_.shape[1]} vs {n_features}), re-fitting …')
+                cache_file.unlink()
+        except Exception:
+            cache_file.unlink()
+
+    if not cache_valid:
         model = GaussianHMM(
             n_components=HMM_STATES,
             covariance_type='full',
