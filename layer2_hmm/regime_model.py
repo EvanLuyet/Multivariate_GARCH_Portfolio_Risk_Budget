@@ -123,10 +123,24 @@ def run_hmm(garch_history: dict, data: pd.DataFrame) -> dict:
           f'({feat_df.index[0].date()} → {feat_df.index[-1].date()}) …')
 
     # ── Fit or load ────────────────────────────────────────────────────────────
+    n_features = X_raw.shape[1]
+    loaded_from_cache = False
+
     if cache_file.exists():
-        model, scaler = joblib.load(cache_file)
-        print('Layer 2 — Loading HMM from cache …')
-    else:
+        cached_model, cached_scaler = joblib.load(cache_file)
+        if cached_model.means_.shape[1] == n_features:
+            model, scaler = cached_model, cached_scaler
+            X_scaled = scaler.transform(X_raw)   # use cached scaler's parameters
+            loaded_from_cache = True
+            print('Layer 2 — Loading HMM from cache …')
+        else:
+            print(
+                f'Layer 2 — Stale cache (trained on {cached_model.means_.shape[1]} '
+                f'features, current data has {n_features}). Retraining …'
+            )
+            cache_file.unlink()
+
+    if not loaded_from_cache:
         model = GaussianHMM(
             n_components=HMM_STATES,
             covariance_type='full',
