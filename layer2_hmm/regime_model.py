@@ -45,39 +45,48 @@ def _build_daily_features(daily_garch_vols: pd.DataFrame,
     """
     Build the HMM input feature matrix at daily frequency.
 
-    Using daily data (~2 500 rows vs ~40 quarterly) gives the HMM enough
-    observations to reliably separate three regimes and produce calibrated
-    posterior probabilities.
+    Feature design principle: every feature must have meaningfully different
+    distributions across Bull / Transition / Crisis regimes. Smooth signals
+    (e.g. full-sample GARCH conditional vol) are poor discriminators because
+    they barely change between calm and stressed days.
 
-    Features capture three dimensions that historically distinguish regimes:
-      - Volatility level   : GARCH conditional vol per asset, 21-day realized vol
-      - Macro stress       : VIX, yield curve slope, credit spread, USD strength
-      - Price trend        : 21-day and 63-day S&P momentum
+    Core features (work even without FRED data):
+      - Realized vol at 5d / 21d / 63d — spikes sharply in crises
+      - Vol acceleration (5d/63d ratio) — detects regime transitions early
+      - Rolling max-drawdown (63d) — distinguishes bear markets
+      - Absolute daily return of S&P — captures tail shock days
+      - 21d and 63d momentum — trend direction signal
+    Optional macro features (if FRED_API_KEY is set):
+      - VIX, yield curve, credit spread, USD index
     """
     sp_ret = 'ret_SP500'
+    r      = data[sp_ret].reindex(daily_garch_vols.index)
     feat   = pd.DataFrame(index=daily_garch_vols.index)
 
-    # ── GARCH conditional vols (daily, annualized) ────────────────────────────
-    for col in daily_garch_vols.columns:
-        feat[col] = daily_garch_vols[col]
+    # ── Multi-horizon realized vol — the primary regime discriminator ─────────
+    for window, label in [(5, '5d'), (21, '21d'), (63, '63d')]:
+        feat[f'realized_vol_{label}'] = r.rolling(window).std() * np.sqrt(TRADING_DAYS)
 
-    # ── 21-day realized vol of S&P (short-term stress proxy) ─────────────────
-    feat['realized_vol_21d'] = (
-        data[sp_ret].rolling(21).std() * np.sqrt(TRADING_DAYS)
-    ).reindex(feat.index)
+    # ── Vol acceleration: short/long ratio spikes at regime transitions ───────
+    feat['vol_accel'] = feat['realized_vol_5d'] / (feat['realized_vol_63d'] + 1e-8)
 
-    # ── Macro features (forward-filled from FRED, may be NaN if no API key) ──
+    # ── Rolling 63-day max drawdown — negative in bear markets ───────────────
+    prices = data[f'price_SP500'].reindex(daily_garch_vols.index)
+    roll_max = prices.rolling(63, min_periods=1).max()
+    feat['drawdown_63d'] = (prices - roll_max) / (roll_max + 1e-8)
+
+    # ── Absolute daily return — captures tail shock days ──────────────────────
+    feat['abs_ret'] = r.abs()
+
+    # ── Momentum at 21d and 63d — trend signal ───────────────────────────────
+    feat['momentum_21d'] = r.rolling(21).sum()
+    feat['momentum_63d'] = r.rolling(63).sum()
+
+    # ── Macro features (optional — zero-filled if FRED key absent) ───────────
     for col in ['vix', 'yield_curve', 'credit_spread', 'usd_index']:
-        if col in data.columns:
-            feat[col] = data[col].reindex(feat.index, method='ffill')
-        else:
-            feat[col] = np.nan
+        feat[col] = data[col].reindex(feat.index, method='ffill') \
+                   if col in data.columns else 0.0
 
-    # ── S&P momentum at 21-day and 63-day horizons ────────────────────────────
-    feat['momentum_21d'] = data[sp_ret].rolling(21).sum().reindex(feat.index)
-    feat['momentum_63d'] = data[sp_ret].rolling(63).sum().reindex(feat.index)
-
-    # Fill NaNs: forward-fill first, then fill any remaining with column median
     feat = feat.ffill().fillna(feat.median(numeric_only=True)).fillna(0.0)
     feat = feat.dropna()
     return feat
@@ -141,21 +150,32 @@ def run_hmm(garch_history: dict, data: pd.DataFrame) -> dict:
             cache_file.unlink()
 
     if not cache_valid:
-        model = GaussianHMM(
-            n_components=HMM_STATES,
-            covariance_type='full',
-            n_iter=300,
-            random_state=RANDOM_SEED,
-            tol=1e-5,
-        )
-        model.fit(X_scaled)
+        # ── Multi-seed fit: pick the model with the highest log-likelihood ────
+        # 'diag' covariance (n_states × n_features × 2 params) is far more
+        # stable than 'full' (n_states × n_features² params) with ~2 500 rows.
+        # Multiple random seeds guard against local optima.
+        best_model, best_score = None, -np.inf
+        for seed in [RANDOM_SEED, RANDOM_SEED + 1, RANDOM_SEED + 2]:
+            candidate = GaussianHMM(
+                n_components=HMM_STATES,
+                covariance_type='diag',
+                n_iter=300,
+                random_state=seed,
+                tol=1e-4,
+            )
+            candidate.fit(X_scaled)
+            score = candidate.score(X_scaled)
+            if score > best_score:
+                best_score = score
+                best_model = candidate
+        model = best_model
         joblib.dump((model, scaler), cache_file)
 
     raw_states  = model.predict(X_scaled)
     state_probs = model.predict_proba(X_scaled)
 
-    # ── Sort states ascending by mean GARCH vol (state 0 = lowest = Bull) ─────
-    vol_col_idx = feat_df.columns.get_loc('garch_vol_SP500')
+    # ── Sort states ascending by mean realized vol (state 0 = lowest = Bull) ──
+    vol_col_idx = feat_df.columns.get_loc('realized_vol_21d')
     state_means = np.array([
         X_raw[raw_states == s, vol_col_idx].mean()
         if (raw_states == s).any() else 0.0
