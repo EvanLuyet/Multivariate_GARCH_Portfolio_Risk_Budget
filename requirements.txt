@@ -1,7 +1,14 @@
 arch
+fredapi
+hmmlearn
+joblib
+lightgbm
 matplotlib
 numpy
 pandas
+pyarrow
+scikit-learn
 scipy
 tqdm
+xgboost
 yfinance
