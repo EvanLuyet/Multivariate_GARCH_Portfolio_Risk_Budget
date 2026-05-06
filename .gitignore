@@ -1,3 +1,5 @@
 __pycache__/
 results/*.png
 .model_cache/
+data/cache.parquet
+portfolio_state.json
