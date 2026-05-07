@@ -112,8 +112,12 @@ def run_garch(data: pd.DataFrame, weights: dict) -> dict:
     cache_file = cache_dir / f'garch_{datetime.today().strftime("%Y%m%d")}.joblib'
 
     if cache_file.exists():
-        print('Layer 1 — Loading GARCH history from cache …')
-        return joblib.load(cache_file)
+        try:
+            cached = joblib.load(cache_file)
+            print('Layer 1 — Loading GARCH history from cache …')
+            return cached
+        except Exception:
+            cache_file.unlink()
 
     ret_cols = [f'ret_{a}' for a in ASSETS]
     dates    = data.index
