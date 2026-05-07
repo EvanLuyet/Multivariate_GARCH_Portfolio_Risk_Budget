@@ -48,19 +48,46 @@ def _fetch_fred_series(series_id: str, start: str, end: str) -> pd.Series:
         return pd.Series(dtype=float, name=series_id)
 
 
+def _extract_close(raw: pd.DataFrame, tickers: list) -> pd.DataFrame:
+    """
+    Pull the close-price columns out of a yfinance DataFrame.
+    Handles all known column structures across yfinance versions:
+      - MultiIndex (Close|Price, Ticker)  — standard multi-ticker
+      - MultiIndex (Ticker, Close|Price)  — transposed (older builds)
+      - Flat columns with 'Close'         — single-ticker
+    """
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = raw.columns.get_level_values(0).unique().tolist()
+        lvl1 = raw.columns.get_level_values(1).unique().tolist()
+        for label in ('Close', 'Price', 'Adj Close'):
+            if label in lvl0:
+                raw = raw[label]
+                break
+            if label in lvl1:
+                raw = raw.xs(label, axis=1, level=1)
+                break
+        else:
+            raw = raw[lvl0[0]]   # last resort: first available field
+    elif 'Close' in raw.columns:
+        raw = raw[['Close']]
+        if len(tickers) == 1:
+            raw.columns = tickers
+    # Coerce Series → DataFrame (single-ticker edge case)
+    if isinstance(raw, pd.Series):
+        raw = raw.to_frame(name=tickers[0])
+    if len(tickers) == 1 and isinstance(raw, pd.DataFrame) and raw.shape[1] == 1:
+        raw.columns = tickers
+    return raw
+
+
 def _safe_download(tickers: list, start: str, end: str) -> pd.DataFrame:
     """Download closing prices; always returns a DataFrame (empty on failure)."""
     try:
         raw = yf.download(tickers, start=start, end=end,
                           auto_adjust=True, progress=False)
-        # Handle both multi-ticker (MultiIndex cols) and single-ticker outputs
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw = raw['Close']
-        elif 'Close' in raw.columns:
-            raw = raw[['Close']]
-        if len(tickers) == 1 and raw.shape[1] == 1:
-            raw.columns = tickers
-        return raw.dropna(how='all')
+        if raw.empty:
+            return pd.DataFrame()
+        return _extract_close(raw, tickers).dropna(how='all')
     except Exception as exc:
         warnings.warn(f'Download failed for {tickers}: {exc}')
         return pd.DataFrame()
