@@ -86,24 +86,37 @@ def _compute_target(qe, next_qe, data: pd.DataFrame) -> dict:
 
 
 def _point_and_bounds(X_train, y_train, X_pred, valid_mask):
-    """Fit XGB + LGB quantile and return (point, low, high)."""
+    """
+    Fit XGB point forecast + LGB 25th/75th quantile bounds.
+
+    The point and quantile models are independent, so the point can fall
+    outside [low, high]. We enforce containment after fitting:
+        low  = min(lgb_q25, point)
+        high = max(lgb_q75, point)
+    This guarantees the interval always brackets the point estimate.
+    """
     xg = xgb.XGBRegressor(**XGB_PARAMS)
     xg.fit(X_train[valid_mask], y_train[valid_mask])
     point = float(xg.predict(X_pred)[0])
 
     low_val, high_val = point - 0.03, point + 0.03
     try:
-        for alpha, store in [(LGB_QUANTILES[0], 'lo'), (LGB_QUANTILES[1], 'hi')]:
-            lg = lgb.LGBMRegressor(objective='quantile', alpha=alpha,
+        lg_lo = lgb.LGBMRegressor(objective='quantile', alpha=LGB_QUANTILES[0],
                                    n_estimators=200, random_state=RANDOM_SEED,
                                    verbose=-1)
-            lg.fit(X_train[valid_mask], y_train[valid_mask])
-            if alpha == LGB_QUANTILES[0]:
-                low_val  = float(lg.predict(X_pred)[0])
-            else:
-                high_val = float(lg.predict(X_pred)[0])
+        lg_hi = lgb.LGBMRegressor(objective='quantile', alpha=LGB_QUANTILES[1],
+                                   n_estimators=200, random_state=RANDOM_SEED,
+                                   verbose=-1)
+        lg_lo.fit(X_train[valid_mask], y_train[valid_mask])
+        lg_hi.fit(X_train[valid_mask], y_train[valid_mask])
+        low_val  = float(lg_lo.predict(X_pred)[0])
+        high_val = float(lg_hi.predict(X_pred)[0])
     except Exception:
         pass
+
+    # Enforce: point must be within [low, high]
+    low_val  = min(low_val,  point)
+    high_val = max(high_val, point)
 
     return point, low_val, high_val
 
