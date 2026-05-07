@@ -15,6 +15,41 @@ ASSETS = list(TICKERS.keys())
 BASE_WEIGHTS  = {'SP500': 0.65, 'NDX': 0.20, 'EUROPE': 0.15}
 WEIGHT_BOUNDS = {'SP500': (0.40, 0.80), 'NDX': (0.10, 0.40), 'EUROPE': (0.10, 0.30)}
 
+# ── Regional market benchmarks (for per-market regime detection) ───────────────
+MARKET_TICKERS = {
+    'US':    '^GSPC',
+    'EU':    '^STOXX50E',
+    'Swiss': '^SSMI',
+}
+
+# ── FX pairs — expressed as CHF per foreign unit ──────────────────────────────
+# USDCHF=X : CHF per 1 USD  (high = CHF weak vs USD, hurts CHF investor in USD assets)
+# EURCHF=X : CHF per 1 EUR  (high = CHF weak vs EUR)
+# EURUSD=X : USD per 1 EUR
+FX_TICKERS = {
+    'USDCHF': 'USDCHF=X',
+    'EURCHF': 'EURCHF=X',
+    'EURUSD': 'EURUSD=X',
+}
+
+# ── Stock screener universe (US + European large-caps) ────────────────────────
+STOCK_UNIVERSE = [
+    # US mega-cap
+    'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'BRK-B', 'JPM',
+    'JNJ', 'XOM', 'UNH', 'V', 'MA', 'AVGO', 'PG', 'HD', 'COST', 'LLY',
+    # European / Swiss (US-listed or ADRs)
+    'ASML', 'NVO', 'SAP', 'AZN', 'SHEL', 'TTE', 'UBS', 'ABB',
+]
+
+# ── IBKR Tiered commission model (USD) ────────────────────────────────────────
+IBKR_MIN_COMMISSION  = 1.00     # minimum per order
+IBKR_RATE_PER_SHARE  = 0.005    # per share
+IBKR_FX_COST         = 0.00002  # 0.002% of converted FX amount
+IBKR_SPREAD_BPS      = 0.5      # estimated bid-ask spread for liquid ETFs
+
+# ── Rebalancing band — only recommend if weight has drifted beyond this ────────
+REBALANCE_BAND = 0.05   # 5 percentage points
+
 # ── Vol targeting ──────────────────────────────────────────────────────────────
 TARGET_VOL  = 0.12
 VOL_LOW     = 0.10
@@ -22,21 +57,21 @@ VOL_HIGH    = 0.14
 
 # ── Risk / cost ────────────────────────────────────────────────────────────────
 RISK_FREE_RATE   = 0.02
-TRANSACTION_COST = 0.0005   # 5 bps per ETF leg
-LAMBDA_TC        = 0.001    # TC penalty weight inside BL optimizer
+TRANSACTION_COST = 0.0005   # fallback 5 bps per leg when share price unknown
+LAMBDA_TC        = 0.001    # turnover penalty inside BL optimizer
 
 # ── Model windows ─────────────────────────────────────────────────────────────
 GARCH_WINDOW   = 252
 CORR_WINDOW    = 63
 HMM_STATES     = 3
-HMM_PROB_FLOOR = 0.05   # minimum probability per regime — prevents degenerate [1,0,0] posteriors
+HMM_PROB_FLOOR = 0.05
 LOOKBACK_YEARS = 10
 REBALANCE_FREQ = 'Q'
 TRADING_DAYS   = 252
 
 # ── Black-Litterman ────────────────────────────────────────────────────────────
-DELTA = 2.5   # market risk-aversion coefficient
-TAU   = 0.05  # uncertainty scaling of the prior
+DELTA = 2.5
+TAU   = 0.05
 
 # ── XGBoost / LightGBM ────────────────────────────────────────────────────────
 XGB_PARAMS = dict(
@@ -49,7 +84,7 @@ XGB_PARAMS = dict(
     verbosity=0,
 )
 LGB_QUANTILES   = [0.25, 0.75]
-MIN_TRAIN_QTRS  = 24   # 6 years of quarter-ends before first ML forecast
+MIN_TRAIN_QTRS  = 24
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 CACHE_PATH      = 'data/cache.parquet'
