@@ -130,17 +130,30 @@ def fetch_data(force_refresh: bool = False) -> pd.DataFrame:
     df['price_mkt_US'] = df['price_SP500']
 
     # ── EU and Swiss benchmarks ────────────────────────────────────────────────
+    # Fallback ETFs used when index symbols (^STOXX50E, ^SSMI) fail yfinance.
+    # FEZ tracks EURO STOXX 50; EWL tracks MSCI Switzerland — both highly liquid.
+    MARKET_FALLBACKS = {'EU': 'FEZ', 'Swiss': 'EWL'}
+
     for market, ticker in {k: v for k, v in MARKET_TICKERS.items() if k != 'US'}.items():
-        try:
-            mkt_raw = _safe_download([ticker], start_str, end_str)
-            if mkt_raw.empty:
-                raise ValueError('empty response')
-            mkt_raw.columns = [market]
-            mkt_ret = np.log(mkt_raw / mkt_raw.shift(1)).dropna()
-            df[f'ret_mkt_{market}']   = mkt_ret[market].reindex(df.index, method='ffill').fillna(0.0)
-            df[f'price_mkt_{market}'] = mkt_raw[market].reindex(df.index, method='ffill')
-        except Exception as exc:
-            warnings.warn(f'Benchmark {market} ({ticker}) unavailable: {exc}. Using SP500 proxy.')
+        candidates = [ticker, MARKET_FALLBACKS.get(market, ticker)]
+        loaded = False
+        for candidate in candidates:
+            try:
+                mkt_raw = _safe_download([candidate], start_str, end_str)
+                if mkt_raw.empty:
+                    continue
+                mkt_raw.columns = [market]
+                mkt_ret = np.log(mkt_raw / mkt_raw.shift(1)).dropna()
+                df[f'ret_mkt_{market}']   = mkt_ret[market].reindex(df.index, method='ffill').fillna(0.0)
+                df[f'price_mkt_{market}'] = mkt_raw[market].reindex(df.index, method='ffill')
+                if candidate != ticker:
+                    print(f'  Benchmark {market}: index {ticker} failed, using ETF proxy {candidate}.')
+                loaded = True
+                break
+            except Exception:
+                continue
+        if not loaded:
+            warnings.warn(f'Benchmark {market} unavailable (tried {candidates}). Using SP500 proxy.')
             df[f'ret_mkt_{market}']   = df['ret_SP500']
             df[f'price_mkt_{market}'] = df['price_SP500']
 
