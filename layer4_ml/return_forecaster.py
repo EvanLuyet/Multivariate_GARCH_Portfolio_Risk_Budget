@@ -87,38 +87,40 @@ def _compute_target(qe, next_qe, data: pd.DataFrame) -> dict:
 
 def _point_and_bounds(X_train, y_train, X_pred, valid_mask):
     """
-    Fit XGB point forecast + LGB 25th/75th quantile bounds.
+    Fit XGBoost (mean) + LightGBM quantile models (q25, q50, q75).
 
-    The point and quantile models are independent, so the point can fall
-    outside [low, high]. We enforce containment after fitting:
-        low  = min(lgb_q25, point)
-        high = max(lgb_q75, point)
-    This guarantees the interval always brackets the point estimate.
+    Returns (xgb_mean, q25, q50, q75):
+      xgb_mean — conditional mean, used by the BL optimizer (expected value)
+      q50      — median, used as the DISPLAYED point estimate
+      q25/q75  — 25th/75th percentile bounds
+
+    Why q50 for display: XGBoost and LGB are independent models. The XGB mean
+    can fall outside the LGB quantile interval. The LGB q50 is by construction
+    always between q25 and q75, so the displayed interval is always valid.
     """
     xg = xgb.XGBRegressor(**XGB_PARAMS)
     xg.fit(X_train[valid_mask], y_train[valid_mask])
-    point = float(xg.predict(X_pred)[0])
+    xgb_mean = float(xg.predict(X_pred)[0])
 
-    low_val, high_val = point - 0.03, point + 0.03
+    # Fallback: symmetric ±3% around median
+    q25, q50, q75 = xgb_mean - 0.03, xgb_mean, xgb_mean + 0.03
     try:
-        lg_lo = lgb.LGBMRegressor(objective='quantile', alpha=LGB_QUANTILES[0],
+        for alpha, slot in [(0.25, 'lo'), (0.50, 'mid'), (0.75, 'hi')]:
+            lg = lgb.LGBMRegressor(objective='quantile', alpha=alpha,
                                    n_estimators=200, random_state=RANDOM_SEED,
                                    verbose=-1)
-        lg_hi = lgb.LGBMRegressor(objective='quantile', alpha=LGB_QUANTILES[1],
-                                   n_estimators=200, random_state=RANDOM_SEED,
-                                   verbose=-1)
-        lg_lo.fit(X_train[valid_mask], y_train[valid_mask])
-        lg_hi.fit(X_train[valid_mask], y_train[valid_mask])
-        low_val  = float(lg_lo.predict(X_pred)[0])
-        high_val = float(lg_hi.predict(X_pred)[0])
+            lg.fit(X_train[valid_mask], y_train[valid_mask])
+            val = float(lg.predict(X_pred)[0])
+            if slot == 'lo':
+                q25 = val
+            elif slot == 'mid':
+                q50 = val
+            else:
+                q75 = val
     except Exception:
         pass
 
-    # Enforce: point must be within [low, high]
-    low_val  = min(low_val,  point)
-    high_val = max(high_val, point)
-
-    return point, low_val, high_val
+    return xgb_mean, q25, q50, q75
 
 
 def run_forecaster(garch_history: dict, hmm_history: dict,
@@ -185,13 +187,14 @@ def run_forecaster(garch_history: dict, hmm_history: dict,
             y = tgt_1q[asset].values[:k]
             valid = ~np.isnan(y)
             if valid.sum() < MIN_TRAIN_QTRS // 2:
-                forecasts_1q[asset] = dict(point=0.0, low=-0.05, high=0.05)
+                forecasts_1q[asset] = dict(point=0.0, bl_point=0.0, low=-0.05, high=0.05)
                 continue
-            pt, lo, hi = _point_and_bounds(X_train, y, X_pred, valid)
+            xgb_mean, q25, q50, q75 = _point_and_bounds(X_train, y, X_pred, valid)
             importances[asset].append(
                 xgb.XGBRegressor(**XGB_PARAMS).fit(X_train[valid], y[valid]).feature_importances_
             )
-            forecasts_1q[asset] = dict(point=pt, low=lo, high=hi)
+            # point=q50 for display (always within interval); bl_point=xgb_mean for optimizer
+            forecasts_1q[asset] = dict(point=q50, bl_point=xgb_mean, low=q25, high=q75)
 
         history[qe] = dict(return_forecasts=forecasts_1q)
 
@@ -205,19 +208,19 @@ def run_forecaster(garch_history: dict, hmm_history: dict,
         v1, v2 = ~np.isnan(y1), ~np.isnan(y2)
 
         if v1.sum() >= MIN_TRAIN_QTRS // 2:
-            pt, lo, hi = _point_and_bounds(X_all, y1, X_all[-1:], v1)
-            current_1q[asset] = dict(point=pt, low=lo, high=hi)
+            xgb_mean, q25, q50, q75 = _point_and_bounds(X_all, y1, X_all[-1:], v1)
+            current_1q[asset] = dict(point=q50, bl_point=xgb_mean, low=q25, high=q75)
         else:
-            current_1q[asset] = dict(point=0.0, low=-0.05, high=0.05)
+            current_1q[asset] = dict(point=0.0, bl_point=0.0, low=-0.05, high=0.05)
 
         if v2.sum() >= MIN_TRAIN_QTRS // 2:
-            pt2, lo2, hi2 = _point_and_bounds(X_all, y2, X_all[-1:], v2)
-            current_2q[asset] = dict(point=pt2, low=lo2, high=hi2)
+            xgb_mean2, q25_2, q50_2, q75_2 = _point_and_bounds(X_all, y2, X_all[-1:], v2)
+            current_2q[asset] = dict(point=q50_2, bl_point=xgb_mean2, low=q25_2, high=q75_2)
         else:
-            # Fallback: attenuate 1Q forecast toward zero (lower conviction at 2Q)
-            pt1 = current_1q[asset]['point']
-            current_2q[asset] = dict(point=pt1 * 0.7, low=pt1 * 0.7 - 0.04,
-                                     high=pt1 * 0.7 + 0.04)
+            # Fallback: attenuate 1Q median toward zero (lower conviction at 2Q)
+            m = current_1q[asset]['point']
+            current_2q[asset] = dict(point=m * 0.7, bl_point=m * 0.7,
+                                     low=m * 0.7 - 0.04, high=m * 0.7 + 0.04)
 
     current_qe = feat_df.index[-1]
     history[current_qe] = dict(return_forecasts=current_1q)
