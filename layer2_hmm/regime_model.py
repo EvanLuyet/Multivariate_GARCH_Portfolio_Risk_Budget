@@ -67,14 +67,38 @@ def _build_daily_features(daily_garch_vols: pd.DataFrame,
     return feat.dropna()
 
 
-def _build_market_features(ret: pd.Series, price: pd.Series) -> pd.DataFrame:
-    """4-feature matrix used for per-market lightweight HMMs."""
+def _build_market_features(ret: pd.Series, price: pd.Series,
+                            us_ret: pd.Series | None = None) -> pd.DataFrame:
+    """
+    8-feature matrix for per-market HMMs.
+
+    Absolute features capture the market's own vol/trend regime.
+    Relative features (vs US) are the key differentiators: even during
+    global risk-off, EU and Swiss can diverge meaningfully from the US.
+    For the US market itself, rel_* features are zero by construction,
+    which still produces a distinct feature distribution vs EU/Swiss.
+    """
     feat = pd.DataFrame(index=ret.index)
+
+    # ── Absolute ──────────────────────────────────────────────────────────────
     feat['vol_21d']      = ret.rolling(21).std() * np.sqrt(TRADING_DAYS)
     feat['vol_63d']      = ret.rolling(63).std() * np.sqrt(TRADING_DAYS)
+    feat['vol_accel']    = feat['vol_21d'] / (feat['vol_63d'] + 1e-8)
     roll_max             = price.rolling(63, min_periods=1).max()
     feat['drawdown_63d'] = (price - roll_max) / (roll_max + 1e-8)
+    feat['momentum_21d'] = ret.rolling(21).sum()
     feat['momentum_63d'] = ret.rolling(63).sum()
+
+    # ── Relative vs US (zero for US itself, non-zero for EU/Swiss) ───────────
+    if us_ret is not None:
+        us_vol = us_ret.rolling(21).std() * np.sqrt(TRADING_DAYS)
+        feat['rel_vol']     = feat['vol_21d'] / (us_vol.reindex(feat.index) + 1e-8)
+        feat['rel_mom_21d'] = (ret.rolling(21).sum()
+                               - us_ret.reindex(ret.index).rolling(21).sum())
+    else:
+        feat['rel_vol']     = 1.0
+        feat['rel_mom_21d'] = 0.0
+
     return feat.ffill().fillna(0.0).dropna()
 
 
@@ -215,14 +239,12 @@ def run_hmm(garch_history: dict, data: pd.DataFrame) -> dict:
 
 def run_market_regimes(data: pd.DataFrame) -> dict:
     """
-    Run a lightweight 4-feature HMM independently for each regional market.
+    Run a lightweight 8-feature HMM independently for each regional market.
+    Relative-to-US features ensure EU and Swiss produce distinct outputs even
+    when global correlations are high.
 
-    Returns a dict keyed by market name ('US', 'EU', 'Swiss'), each containing:
-        regime        — current integer regime (0/1/2)
-        regime_label  — emoji label
-        regime_probs  — [p_bull, p_transition, p_crisis]
-        trend         — 'improving' / 'deteriorating' / 'stable' vs 3 months ago
-        regime_series — daily integer series
+    Returns a dict keyed by market name ('US', 'EU', 'Swiss'), each with:
+        regime, regime_label, regime_probs, trend, regime_series, using_proxy
     """
     cache_dir  = Path(MODEL_CACHE_DIR)
     cache_dir.mkdir(exist_ok=True)
@@ -234,15 +256,26 @@ def run_market_regimes(data: pd.DataFrame) -> dict:
 
     print('Layer 2 — Fitting per-market regime HMMs (US / EU / Swiss) …')
 
+    us_ret = data['ret_SP500']
+
     results = {}
     for market in MARKET_TICKERS:
         ret_col   = f'ret_mkt_{market}'
         price_col = f'price_mkt_{market}'
 
-        ret   = data[ret_col]   if ret_col   in data.columns else data['ret_SP500']
+        ret   = data[ret_col]   if ret_col   in data.columns else us_ret
         price = data[price_col] if price_col in data.columns else data['price_SP500']
 
-        feat = _build_market_features(ret, price)
+        # Detect if EU/Swiss silently fell back to SP500 data (identical series)
+        using_proxy = False
+        if market != 'US' and ret.equals(us_ret):
+            using_proxy = True
+            print(f'  ⚠  {market}: benchmark download failed — regime will mirror US. '
+                  f'Check that ret_mkt_{market} is populated in the data cache.')
+
+        # Pass us_ret so relative features are computed; US gets rel_* = 0/1
+        mkt_us_ret = us_ret if market != 'US' else None
+        feat = _build_market_features(ret, price, us_ret=mkt_us_ret)
         if len(feat) < 100:
             results[market] = _fallback_regime(market)
             continue
@@ -251,7 +284,7 @@ def run_market_regimes(data: pd.DataFrame) -> dict:
         scaler   = StandardScaler()
         X_scaled = scaler.fit_transform(X_raw)
 
-        model = _fit_hmm(X_scaled, n_seeds=3)
+        model = _fit_hmm(X_scaled, n_seeds=5)   # more seeds for stability
 
         vol_col_idx = list(feat.columns).index('vol_21d')
         states, probs = _sort_and_floor(model, X_raw, X_scaled, vol_col_idx)
@@ -263,7 +296,7 @@ def run_market_regimes(data: pd.DataFrame) -> dict:
         current_regime = int(regime_series.iloc[-1])
         current_probs  = probs_series.iloc[-1].values.tolist()
 
-        # Trend: compare current regime prob(Bull) vs 63 trading days ago
+        # Trend: compare Bull probability vs 63 trading days ago
         trend = 'stable'
         if len(probs_series) > 63:
             p_bull_now  = probs_series['p0'].iloc[-1]
@@ -279,8 +312,10 @@ def run_market_regimes(data: pd.DataFrame) -> dict:
             regime_probs  = current_probs,
             trend         = trend,
             regime_series = regime_series,
+            using_proxy   = using_proxy,
         )
-        print(f'  {market:6s}: {REGIME_LABELS[current_regime]}  '
+        proxy_note = ' [SP500 proxy]' if using_proxy else ''
+        print(f'  {market:6s}: {REGIME_LABELS[current_regime]}{proxy_note}  '
               f'(Bull {current_probs[0]:.0%} / Trans {current_probs[1]:.0%} / '
               f'Crisis {current_probs[2]:.0%})  trend: {trend}')
 
