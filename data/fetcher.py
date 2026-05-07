@@ -48,19 +48,46 @@ def _fetch_fred_series(series_id: str, start: str, end: str) -> pd.Series:
         return pd.Series(dtype=float, name=series_id)
 
 
+def _extract_close(raw: pd.DataFrame, tickers: list) -> pd.DataFrame:
+    """
+    Pull the close-price columns out of a yfinance DataFrame.
+    Handles all known column structures across yfinance versions:
+      - MultiIndex (Close|Price, Ticker)  — standard multi-ticker
+      - MultiIndex (Ticker, Close|Price)  — transposed (older builds)
+      - Flat columns with 'Close'         — single-ticker
+    """
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = raw.columns.get_level_values(0).unique().tolist()
+        lvl1 = raw.columns.get_level_values(1).unique().tolist()
+        for label in ('Close', 'Price', 'Adj Close'):
+            if label in lvl0:
+                raw = raw[label]
+                break
+            if label in lvl1:
+                raw = raw.xs(label, axis=1, level=1)
+                break
+        else:
+            raw = raw[lvl0[0]]   # last resort: first available field
+    elif 'Close' in raw.columns:
+        raw = raw[['Close']]
+        if len(tickers) == 1:
+            raw.columns = tickers
+    # Coerce Series → DataFrame (single-ticker edge case)
+    if isinstance(raw, pd.Series):
+        raw = raw.to_frame(name=tickers[0])
+    if len(tickers) == 1 and isinstance(raw, pd.DataFrame) and raw.shape[1] == 1:
+        raw.columns = tickers
+    return raw
+
+
 def _safe_download(tickers: list, start: str, end: str) -> pd.DataFrame:
     """Download closing prices; always returns a DataFrame (empty on failure)."""
     try:
         raw = yf.download(tickers, start=start, end=end,
                           auto_adjust=True, progress=False)
-        # Handle both multi-ticker (MultiIndex cols) and single-ticker outputs
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw = raw['Close']
-        elif 'Close' in raw.columns:
-            raw = raw[['Close']]
-        if len(tickers) == 1 and raw.shape[1] == 1:
-            raw.columns = tickers
-        return raw.dropna(how='all')
+        if raw.empty:
+            return pd.DataFrame()
+        return _extract_close(raw, tickers).dropna(how='all')
     except Exception as exc:
         warnings.warn(f'Download failed for {tickers}: {exc}')
         return pd.DataFrame()
@@ -103,17 +130,30 @@ def fetch_data(force_refresh: bool = False) -> pd.DataFrame:
     df['price_mkt_US'] = df['price_SP500']
 
     # ── EU and Swiss benchmarks ────────────────────────────────────────────────
+    # Fallback ETFs used when index symbols (^STOXX50E, ^SSMI) fail yfinance.
+    # FEZ tracks EURO STOXX 50; EWL tracks MSCI Switzerland — both highly liquid.
+    MARKET_FALLBACKS = {'EU': 'FEZ', 'Swiss': 'EWL'}
+
     for market, ticker in {k: v for k, v in MARKET_TICKERS.items() if k != 'US'}.items():
-        try:
-            mkt_raw = _safe_download([ticker], start_str, end_str)
-            if mkt_raw.empty:
-                raise ValueError('empty response')
-            mkt_raw.columns = [market]
-            mkt_ret = np.log(mkt_raw / mkt_raw.shift(1)).dropna()
-            df[f'ret_mkt_{market}']   = mkt_ret[market].reindex(df.index, method='ffill').fillna(0.0)
-            df[f'price_mkt_{market}'] = mkt_raw[market].reindex(df.index, method='ffill')
-        except Exception as exc:
-            warnings.warn(f'Benchmark {market} ({ticker}) unavailable: {exc}. Using SP500 proxy.')
+        candidates = [ticker, MARKET_FALLBACKS.get(market, ticker)]
+        loaded = False
+        for candidate in candidates:
+            try:
+                mkt_raw = _safe_download([candidate], start_str, end_str)
+                if mkt_raw.empty:
+                    continue
+                mkt_raw.columns = [market]
+                mkt_ret = np.log(mkt_raw / mkt_raw.shift(1)).dropna()
+                df[f'ret_mkt_{market}']   = mkt_ret[market].reindex(df.index, method='ffill').fillna(0.0)
+                df[f'price_mkt_{market}'] = mkt_raw[market].reindex(df.index, method='ffill')
+                if candidate != ticker:
+                    print(f'  Benchmark {market}: index {ticker} failed, using ETF proxy {candidate}.')
+                loaded = True
+                break
+            except Exception:
+                continue
+        if not loaded:
+            warnings.warn(f'Benchmark {market} unavailable (tried {candidates}). Using SP500 proxy.')
             df[f'ret_mkt_{market}']   = df['ret_SP500']
             df[f'price_mkt_{market}'] = df['price_SP500']
 

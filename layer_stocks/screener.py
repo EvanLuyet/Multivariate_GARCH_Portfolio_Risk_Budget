@@ -24,6 +24,7 @@ Data is cached for 1 day alongside the main data cache.
 """
 
 import sys
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -58,19 +59,74 @@ SECTOR_MAP = {
 }
 
 
+def _extract_close(raw: pd.DataFrame, tickers: list) -> pd.DataFrame:
+    """Robust close-price extractor — handles all yfinance MultiIndex variants."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        lvl0 = raw.columns.get_level_values(0).unique().tolist()
+        lvl1 = raw.columns.get_level_values(1).unique().tolist()
+        for label in ('Close', 'Price', 'Adj Close'):
+            if label in lvl0:
+                return raw[label]
+            if label in lvl1:
+                return raw.xs(label, axis=1, level=1)
+        return raw[lvl0[0]]
+    if 'Close' in raw.columns:
+        out = raw[['Close']]
+        if len(tickers) == 1:
+            out.columns = tickers
+        return out
+    if isinstance(raw, pd.Series):
+        return raw.to_frame(name=tickers[0])
+    return raw
+
+
 def _fetch_stock_data(tickers: list, lookback_days: int = 180) -> pd.DataFrame:
-    """Download closing prices for the stock universe; return price DataFrame."""
+    """
+    Download closing prices in batches of 5 with a 1 s pause between batches
+    to stay within Yahoo Finance rate limits.
+    Falls back to per-ticker download for any batch that fails.
+    """
     end   = datetime.today().strftime('%Y-%m-%d')
     start = (datetime.today() - timedelta(days=lookback_days + 30)).strftime('%Y-%m-%d')
-    try:
-        raw = yf.download(tickers, start=start, end=end,
-                          auto_adjust=True, progress=False)
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw = raw['Close']
-        return raw.dropna(how='all')
-    except Exception as exc:
-        warnings.warn(f'Stock universe download failed: {exc}')
+
+    frames = []
+    n_batches = (len(tickers) + 4) // 5
+    for i in range(0, len(tickers), 5):
+        batch = tickers[i:i + 5]
+        batch_num = i // 5 + 1
+        try:
+            raw = yf.download(batch, start=start, end=end,
+                              auto_adjust=True, progress=False, threads=False)
+            if raw.empty:
+                print(f'  Screener batch {batch_num}/{n_batches} empty — skipping {batch}')
+            else:
+                chunk = _extract_close(raw, batch)
+                if isinstance(chunk, pd.Series):
+                    chunk = chunk.to_frame(name=batch[0])
+                elif len(batch) == 1 and chunk.shape[1] == 1:
+                    chunk.columns = batch
+                frames.append(chunk)
+                print(f'  Screener batch {batch_num}/{n_batches} OK '
+                      f'({chunk.shape[1]} tickers, {chunk.shape[0]} rows)')
+        except Exception as exc:
+            print(f'  Screener batch {batch_num}/{n_batches} failed: {exc}')
+            # Per-ticker fallback for the failed batch
+            for ticker in batch:
+                try:
+                    t_raw = yf.download(ticker, start=start, end=end,
+                                        auto_adjust=True, progress=False)
+                    if not t_raw.empty and 'Close' in t_raw.columns:
+                        frames.append(t_raw[['Close']].rename(columns={'Close': ticker}))
+                except Exception:
+                    pass
+        time.sleep(1.0)
+
+    if not frames:
         return pd.DataFrame()
+    result = pd.concat(frames, axis=1)
+    # Drop columns that are entirely NaN (tickers that never downloaded)
+    result = result.dropna(axis=1, how='all')
+    return result
 
 
 def _compute_factors(prices: pd.DataFrame) -> pd.DataFrame:
