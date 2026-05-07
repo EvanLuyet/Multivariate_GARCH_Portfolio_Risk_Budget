@@ -123,9 +123,15 @@ def run_forecaster(garch_history: dict, hmm_history: dict,
     cache_dir.mkdir(exist_ok=True)
     cache_file = cache_dir / f'ml_{datetime.today().strftime("%Y%m%d")}.joblib'
 
+    REQUIRED_KEYS = {'history', 'current_forecast', 'next_quarter_forecast',
+                     'feature_importance', 'feat_df'}
     if cache_file.exists():
-        print('Layer 4 — Loading ML forecasts from cache …')
-        return joblib.load(cache_file)
+        cached = joblib.load(cache_file)
+        if REQUIRED_KEYS.issubset(cached.keys()):
+            print('Layer 4 — Loading ML forecasts from cache …')
+            return cached
+        print('Layer 4 — Stale cache (missing keys), re-running forecaster …')
+        cache_file.unlink()
 
     print('Layer 4 — Running walk-forward ML forecaster …')
 
