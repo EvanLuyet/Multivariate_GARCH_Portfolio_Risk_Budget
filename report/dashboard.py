@@ -28,7 +28,7 @@ import matplotlib.patches as mpatches
 warnings.filterwarnings("ignore")
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import ASSETS, TRADING_DAYS, RISK_FREE_RATE, TARGET_VOL, VOL_LOW, VOL_HIGH
+from config import ASSETS, BASE_WEIGHTS, TRADING_DAYS, RISK_FREE_RATE, TARGET_VOL, VOL_LOW, VOL_HIGH
 
 REGIME_COLORS = {0: "#2ecc71", 1: "#f39c12", 2: "#e74c3c"}
 ASSET_COLORS = ["#2c3e50", "#3498db", "#e67e22"]
@@ -212,9 +212,10 @@ def print_report(
         if p["ticker"] == "N/A":
             print(f'    {p["note"]}')
             break
+        ret_str = f'  3m_ret {p["ret_3m_pct"]:+.1%}' if "ret_3m_pct" in p else ""
         print(
             f'    {p["rank"]}. {p["ticker"]:8s} {p["sector"]:22s} '
-            f'3m_z {p["mom_3m_z"]:+.3f}  Sharpe_z {p["sharpe_z"]:+.2f}  '
+            f'3m_z {p["mom_3m_z"]:+.3f}{ret_str}  Sharpe_z {p["sharpe_z"]:+.2f}  '
             f'— {p["note"]}'
         )
 
@@ -509,6 +510,393 @@ def save_dashboard(
     plt.close(fig)
     print(f"Dashboard saved → {out_path}")
     return out_path
+
+
+# ── Cornish-Fisher VaR / component VaR / ENB ─────────────────────────────────
+
+
+def _cornish_fisher_var(daily_returns: pd.Series, confidence: float = 0.95) -> float:
+    """
+    Modified VaR using Cornish-Fisher expansion to account for skewness and kurtosis.
+    CF-VaR ≈ z_α + (z_α²-1)/6·S + (z_α³-3z_α)/24·K - (2z_α³-5z_α)/36·S²
+    where S=skewness, K=excess kurtosis.
+    """
+    from scipy import stats as sp_stats
+
+    alpha = 1 - confidence
+    z = sp_stats.norm.ppf(alpha)
+    r = daily_returns.dropna()
+    if len(r) < 10:
+        return float(-np.percentile(r, alpha * 100))
+    S = float(sp_stats.skew(r))
+    K = float(sp_stats.kurtosis(r))  # excess kurtosis
+    z_cf = z + (z**2 - 1) * S / 6 + (z**3 - 3 * z) * K / 24 - (2 * z**3 - 5 * z) * S**2 / 36
+    return float(-r.std() * z_cf - r.mean())
+
+
+def _component_var(w: np.ndarray, Sigma_daily: np.ndarray, confidence: float = 0.95) -> np.ndarray:
+    """
+    Component VaR: CVaR_i = w_i × (Σw)_i / σ_port × z_α × σ_port.
+    Returns per-asset component VaR in daily units.
+    """
+    from scipy import stats as sp_stats
+
+    z = abs(sp_stats.norm.ppf(1 - confidence))
+    port_var = float(w @ Sigma_daily @ w)
+    port_vol = np.sqrt(max(port_var, 1e-14))
+    mrc = Sigma_daily @ w / port_vol
+    component_var = w * mrc * z
+    return component_var
+
+
+def compute_enb(risk_contributions: np.ndarray) -> float:
+    """Effective number of bets: 1 / sum(RC_i²). Max = n assets (equal risk)."""
+    rc = np.array(risk_contributions)
+    rc = rc / (rc.sum() + 1e-14)
+    return float(1.0 / max((rc**2).sum(), 1e-14))
+
+
+# ── Drawdown table ────────────────────────────────────────────────────────────
+
+
+def _build_drawdown_table(returns: pd.Series, top_n: int = 5) -> list:
+    """
+    Identify the worst `top_n` drawdowns with start, trough, recovery dates
+    and drawdown magnitude.
+
+    Returns list of dicts: {start, trough, recovery, drawdown_pct, duration_days}
+    """
+    cum = (1 + returns).cumprod()
+    roll_max = cum.cummax()
+    dd = (cum - roll_max) / roll_max
+
+    drawdowns = []
+    in_dd = False
+    start_date = None
+
+    for date, val in dd.items():
+        if val < -1e-6 and not in_dd:
+            in_dd = True
+            start_date = date
+            trough_date = date
+            trough_val = val
+        elif in_dd:
+            if val < trough_val:
+                trough_val = val
+                trough_date = date
+            if val >= -1e-6:
+                in_dd = False
+                drawdowns.append(
+                    dict(
+                        start=start_date,
+                        trough=trough_date,
+                        recovery=date,
+                        drawdown_pct=float(trough_val),
+                        duration_days=int((trough_date - start_date).days),
+                    )
+                )
+    # Handle open drawdown at end of series
+    if in_dd:
+        drawdowns.append(
+            dict(
+                start=start_date,
+                trough=trough_date,
+                recovery=None,
+                drawdown_pct=float(trough_val),
+                duration_days=int((trough_date - start_date).days),
+            )
+        )
+
+    drawdowns.sort(key=lambda x: x["drawdown_pct"])
+    return drawdowns[:top_n]
+
+
+# ── Rolling metrics ───────────────────────────────────────────────────────────
+
+
+def _rolling_metrics(returns: pd.Series, window: int = TRADING_DAYS) -> pd.DataFrame:
+    """Rolling annualised Sharpe and volatility over `window` trading days."""
+    ann_ret = returns.rolling(window).mean() * TRADING_DAYS
+    ann_vol = returns.rolling(window).std() * np.sqrt(TRADING_DAYS)
+    sharpe = (ann_ret - RISK_FREE_RATE) / ann_vol.clip(lower=1e-8)
+    return pd.DataFrame({"rolling_sharpe": sharpe, "rolling_vol": ann_vol})
+
+
+# ── Equal-weight and risk-parity helpers ─────────────────────────────────────
+
+
+def _equal_weight_returns(garch_history: dict, data: pd.DataFrame) -> pd.Series:
+    """Constant equal-weight (1/N) portfolio return series."""
+    n = len(ASSETS)
+    ew = {a: 1.0 / n for a in ASSETS}
+    q_ends = sorted(garch_history.keys())
+    series = []
+    for k, qe in enumerate(q_ends):
+        end = q_ends[k + 1] if k + 1 < len(q_ends) else data.index[-1]
+        mask = (data.index > qe) & (data.index <= end)
+        period = data.loc[mask, [f"ret_{a}" for a in ASSETS]]
+        if period.empty:
+            continue
+        w_vec = np.array([ew[a] for a in ASSETS])
+        series.append(pd.Series(period.values @ w_vec, index=period.index))
+    return pd.concat(series).sort_index() if series else pd.Series(dtype=float)
+
+
+def _risk_parity_weights(Sigma: np.ndarray, tol: float = 1e-8) -> np.ndarray:
+    """
+    Naive risk-parity (equal risk contribution) via iterative proportional fitting.
+    Closed-form approximation: w_i ∝ 1/σ_i then re-normalise.
+    """
+    daily_vols = np.sqrt(np.diag(Sigma))
+    w = 1.0 / np.maximum(daily_vols, tol)
+    return w / w.sum()
+
+
+def _risk_parity_returns(garch_history: dict, data: pd.DataFrame) -> pd.Series:
+    """Risk-parity portfolio using per-quarter GARCH vol estimates."""
+    q_ends = sorted(garch_history.keys())
+    series = []
+    for k, qe in enumerate(q_ends):
+        Sigma = garch_history[qe]["cov_matrix"]
+        w_vec = _risk_parity_weights(Sigma)
+        end = q_ends[k + 1] if k + 1 < len(q_ends) else data.index[-1]
+        mask = (data.index > qe) & (data.index <= end)
+        period = data.loc[mask, [f"ret_{a}" for a in ASSETS]]
+        if period.empty:
+            continue
+        series.append(pd.Series(period.values @ w_vec, index=period.index))
+    return pd.concat(series).sort_index() if series else pd.Series(dtype=float)
+
+
+# ── CSV artifact writers ──────────────────────────────────────────────────────
+
+
+def save_csv_artifacts(
+    garch_history: dict,
+    bl_history: dict,
+    data: pd.DataFrame,
+    strat_ret: pd.Series,
+    bench_ret: pd.Series,
+    ml_validation: dict | None = None,
+    stock_picks: list | None = None,
+) -> None:
+    """Write reproducible CSV artifacts to results/."""
+    import csv
+
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+
+    # weights_history.csv
+    with open(results_dir / "weights_history.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["quarter_end"] + ASSETS)
+        for qe in sorted(bl_history.keys()):
+            w = bl_history[qe]["optimal_weights"]
+            writer.writerow([str(qe.date())] + [f"{w[a]:.6f}" for a in ASSETS])
+
+    # risk_contributions.csv
+    with open(results_dir / "risk_contributions.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["quarter_end"] + ASSETS + ["port_vol"])
+        for qe in sorted(garch_history.keys()):
+            rc = garch_history[qe]["risk_contributions"]
+            pv = garch_history[qe]["port_vol"]
+            writer.writerow([str(qe.date())] + [f"{rc[a]:.6f}" for a in ASSETS] + [f"{pv:.6f}"])
+
+    # backtest_metrics.csv
+    def _metrics_row(name, r):
+        if r.empty:
+            return [name] + ["N/A"] * 6
+        m = _perf_metrics(r)
+        return [
+            name,
+            f"{m['ann_ret']:.4f}",
+            f"{m['ann_vol']:.4f}",
+            f"{m['sharpe']:.4f}",
+            f"{m['sortino']:.4f}",
+            f"{m['mdd']:.4f}",
+            f"{m['calmar']:.4f}",
+        ]
+
+    ew_ret = _equal_weight_returns(garch_history, data)
+    rp_ret = _risk_parity_returns(garch_history, data)
+
+    with open(results_dir / "backtest_metrics.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["strategy", "ann_ret", "ann_vol", "sharpe", "sortino", "max_drawdown", "calmar"]
+        )
+        writer.writerow(_metrics_row("BL_proposed", strat_ret))
+        writer.writerow(_metrics_row("base_65_20_15", bench_ret))
+        writer.writerow(_metrics_row("equal_weight", ew_ret))
+        writer.writerow(_metrics_row("risk_parity", rp_ret))
+
+    # validation_metrics.csv
+    if ml_validation is not None:
+        with open(results_dir / "validation_metrics.csv", "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "asset",
+                    "hit_rate",
+                    "mae",
+                    "rmse",
+                    "spearman_corr",
+                    "coverage",
+                    "interval_width",
+                    "n_obs",
+                ]
+            )
+            per_asset = ml_validation.get("per_asset", {})
+            for asset in ASSETS:
+                m = per_asset.get(asset, {})
+                writer.writerow(
+                    [
+                        asset,
+                        f"{m.get('hit_rate', np.nan):.4f}",
+                        f"{m.get('mae', np.nan):.4f}",
+                        f"{m.get('rmse', np.nan):.4f}",
+                        f"{m.get('spearman_corr', np.nan):.4f}",
+                        f"{m.get('coverage', np.nan):.4f}",
+                        f"{m.get('interval_width', np.nan):.4f}",
+                        str(m.get("n_obs", 0)),
+                    ]
+                )
+
+    # stock_picks.csv
+    if stock_picks:
+        keys = list(stock_picks[0].keys())
+        with open(results_dir / "stock_picks.csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            for p in stock_picks:
+                if p.get("ticker") != "N/A":
+                    writer.writerow(p)
+
+    print(f"CSV artifacts saved → {results_dir}/")
+
+
+# ── Backtest report (called by main.py backtest subcommand) ───────────────────
+
+
+def build_backtest_report(
+    garch_history: dict,
+    bl_history: dict,
+    data: pd.DataFrame,
+    current_weights: dict,
+) -> None:
+    """
+    Print extended backtest report including:
+    - 5-way strategy comparison (BL, Base, Current, EW, RP)
+    - Worst-5 drawdown table per strategy
+    - Rolling 12m Sharpe and vol
+    - Quarterly turnover summary
+    - Write results/ CSV artifacts
+    """
+    border = "═" * 60
+    thin = "─" * 60
+    print(f"\n{border}")
+    print("  EXTENDED BACKTEST REPORT")
+    print(border)
+
+    strat_ret = _build_strategy_returns(garch_history, bl_history, data, include_tc=True)
+    bench_ret = _build_strategy_returns(
+        garch_history, bl_history, data, weights_override=BASE_WEIGHTS
+    )
+    cur_ret = _build_strategy_returns(
+        garch_history, bl_history, data, weights_override=current_weights
+    )
+    ew_ret = _equal_weight_returns(garch_history, data)
+    rp_ret = _risk_parity_returns(garch_history, data)
+
+    strategies = [
+        ("BL Proposed (TC)", strat_ret),
+        ("Base 65/20/15", bench_ret),
+        ("Current Weights", cur_ret),
+        ("Equal Weight", ew_ret),
+        ("Risk Parity", rp_ret),
+    ]
+
+    # ── Performance table ─────────────────────────────────────────────────────
+    print("\n  ① PERFORMANCE SUMMARY")
+    print(thin)
+    col_w = 13
+    hdr = f'  {"Strategy":22}  {"Ann.Ret":>{col_w}}  {"Ann.Vol":>{col_w}}'
+    hdr += f'  {"Sharpe":>{col_w}}  {"MDD":>{col_w}}'
+    print(hdr)
+    na_row = f"  {'N/A':>{col_w}}  {'N/A':>{col_w}}  {'N/A':>{col_w}}  {'N/A':>{col_w}}"
+    for name, r in strategies:
+        if r.empty:
+            print(f"  {name:22}" + na_row)
+            continue
+        m = _perf_metrics(r)
+        print(
+            f"  {name:22}  "
+            f'{m["ann_ret"]:>{col_w}.2%}  '
+            f'{m["ann_vol"]:>{col_w}.2%}  '
+            f'{m["sharpe"]:>{col_w}.2f}  '
+            f'{m["mdd"]:>{col_w}.2%}'
+        )
+
+    # ── Drawdown table ────────────────────────────────────────────────────────
+    print("\n  ② WORST DRAWDOWNS — BL PROPOSED")
+    print(thin)
+    dd_table = _build_drawdown_table(strat_ret, top_n=5)
+    print(f'  {"Start":12}  {"Trough":12}  {"Recovery":12}  {"Drawdown":>10}  {"Days":>6}')
+    for dd in dd_table:
+        rec = str(dd["recovery"].date()) if dd["recovery"] else "ongoing"
+        print(
+            f'  {str(dd["start"].date()):12}  '
+            f'{str(dd["trough"].date()):12}  '
+            f"{rec:12}  "
+            f'{dd["drawdown_pct"]:>10.2%}  '
+            f'{dd["duration_days"]:>6}'
+        )
+
+    # ── Rolling 12m Sharpe ────────────────────────────────────────────────────
+    print("\n  ③ ROLLING 12M SHARPE (latest value per strategy)")
+    print(thin)
+    for name, r in strategies:
+        if len(r) < TRADING_DAYS:
+            print(f"  {name:22}  insufficient history")
+            continue
+        roll = _rolling_metrics(r, window=TRADING_DAYS)
+        latest_sharpe = (
+            roll["rolling_sharpe"].dropna().iloc[-1]
+            if not roll["rolling_sharpe"].dropna().empty
+            else np.nan
+        )
+        latest_vol = (
+            roll["rolling_vol"].dropna().iloc[-1]
+            if not roll["rolling_vol"].dropna().empty
+            else np.nan
+        )
+        sharpe_str = f"{latest_sharpe:.2f}" if not np.isnan(latest_sharpe) else "N/A"
+        vol_str = f"{latest_vol:.2%}" if not np.isnan(latest_vol) else "N/A"
+        print(f"  {name:22}  Sharpe {sharpe_str:>6}  Vol {vol_str:>7}")
+
+    # ── Quarterly turnover ────────────────────────────────────────────────────
+    print("\n  ④ QUARTERLY TURNOVER — BL PROPOSED")
+    print(thin)
+    q_ends = sorted(bl_history.keys())
+    turnovers = []
+    w_prev = None
+    for qe in q_ends:
+        w_vec = np.array([bl_history[qe]["optimal_weights"][a] for a in ASSETS])
+        if w_prev is not None:
+            to = float(np.abs(w_vec - w_prev).sum())
+            turnovers.append((qe, to))
+        w_prev = w_vec
+    if turnovers:
+        avg_to = np.mean([t for _, t in turnovers])
+        print(f"  Average quarterly turnover: {avg_to:.1%}")
+        print("  Recent quarters:")
+        for qe, to in turnovers[-6:]:
+            print(f"    {str(qe.date()):12}  {to:.1%}")
+
+    # ── CSV output ────────────────────────────────────────────────────────────
+    save_csv_artifacts(garch_history, bl_history, data, strat_ret, bench_ret)
+    print(f"\n{border}\n")
 
 
 if __name__ == "__main__":

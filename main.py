@@ -1,22 +1,21 @@
 """
 main.py — Portfolio Intelligence Engine master runner.
 
-Usage:
-    python main.py                        # normal run, loads cached data
-    python main.py --refresh              # force re-fetch + re-fit all models
-    python main.py --capital 10000        # deploy CHF 10 000 new capital
-    python main.py --portfolio-value 150000  # override portfolio value (USD)
-    python main.py --non-interactive      # skip rebalance prompt (scripts / CI)
+Subcommands:
+    python main.py run      [--refresh] [--capital N] [--portfolio-value N] [--non-interactive]
+    python main.py backtest [--refresh]
+    python main.py report
+    python main.py screen   [--regime {0,1,2}]
 
-After printing the report the bot prompts:
-    "Did you execute this rebalance? [y/n]"
-    → If yes, enter your actual executed weights for accurate next-run comparison.
-    Use --non-interactive to skip this prompt and auto-save proposed weights.
+Backward-compatible: bare flags without a subcommand still invoke `run`.
+    python main.py --refresh          → same as: python main.py run --refresh
+    python main.py --non-interactive  → same as: python main.py run --non-interactive
 """
 
 import json
 import logging
 import argparse
+import sys
 import warnings
 from pathlib import Path
 from datetime import datetime
@@ -121,7 +120,7 @@ def _prompt_state_update(optimal_weights: dict) -> dict | None:
     return executed
 
 
-# ── Main run ──────────────────────────────────────────────────────────────────
+# ── Subcommand: run ───────────────────────────────────────────────────────────
 
 
 def run(
@@ -146,7 +145,7 @@ def run(
     # ── 1. Data ───────────────────────────────────────────────────────────────
     data = fetch_data(force_refresh=force_refresh)
 
-    # ── 2. Layer 1 — GARCH + DCC-style covariance ──────────────────────────────────────────────
+    # ── 2. Layer 1 — GARCH + DCC-style covariance ─────────────────────────────
     garch_history = run_garch(data, current_weights)
     latest_qe = max(garch_history.keys())
     garch_current = garch_history[latest_qe]
@@ -183,12 +182,9 @@ def run(
 
     # ── 9. Transaction costs ──────────────────────────────────────────────────
     optimal_weights = bl_current["optimal_weights"]
-
-    # Last known ETF prices for IBKR commission calculation
     etf_prices = {
         a: float(data[f"price_{a}"].iloc[-1]) for a in ASSETS if f"price_{a}" in data.columns
     }
-
     cost_result = compute_costs(
         current_weights,
         optimal_weights,
@@ -197,10 +193,9 @@ def run(
         etf_prices=etf_prices,
         new_capital_usd=new_capital_usd,
     )
-
     final_weights = optimal_weights if cost_result["rebalance_recommended"] else current_weights
 
-    # ── 10. Build return series for backtest (3-way) ──────────────────────────
+    # ── 10. Build return series for backtest ──────────────────────────────────
     strat_ret = _build_strategy_returns(garch_history, bl_history, data, include_tc=True)
     bench_ret = _build_strategy_returns(
         garch_history, bl_history, data, weights_override=BASE_WEIGHTS
@@ -251,30 +246,232 @@ def run(
         save_state(weights_to_save, portfolio_value_usd)
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Portfolio Intelligence Engine")
-    parser.add_argument(
-        "--refresh", action="store_true", help="Force re-fetch data and re-fit all models"
+# ── Subcommand: backtest ──────────────────────────────────────────────────────
+
+
+def cmd_backtest(force_refresh: bool = False) -> None:
+    """Run a focused backtest comparison and write CSV artifacts."""
+    from report.dashboard import build_backtest_report
+
+    print("\n" + "=" * 60)
+    print("  BACKTEST MODE")
+    print("=" * 60 + "\n")
+
+    if force_refresh:
+        _clear_model_cache()
+
+    state = load_state()
+    current_weights = state.get("weights", BASE_WEIGHTS)
+
+    data = fetch_data(force_refresh=force_refresh)
+    garch_history = run_garch(data, current_weights)
+    hmm_result = run_hmm(garch_history, data)
+    ml_result = run_forecaster(garch_history, hmm_result["history"], data)
+    bl_result = run_black_litterman(
+        garch_history, hmm_result["history"], ml_result["history"], current_weights
     )
-    parser.add_argument(
-        "--capital", type=float, default=0.0, help="New capital to deploy in USD (Scenario B)"
+
+    build_backtest_report(garch_history, bl_result["history"], data, current_weights)
+
+
+# ── Subcommand: report ────────────────────────────────────────────────────────
+
+
+def cmd_report() -> None:
+    """Re-generate the dashboard PNG + terminal report from cached models (no re-fit)."""
+    print("\n" + "=" * 60)
+    print("  REPORT MODE  (cached models)")
+    print("=" * 60 + "\n")
+
+    state = load_state()
+    current_weights = state.get("weights", BASE_WEIGHTS)
+
+    data = fetch_data(force_refresh=False)
+    garch_history = run_garch(data, current_weights)
+    hmm_result = run_hmm(garch_history, data)
+    market_regimes = run_market_regimes(data)
+    ml_result = run_forecaster(garch_history, hmm_result["history"], data)
+    bl_result = run_black_litterman(
+        garch_history, hmm_result["history"], ml_result["history"], current_weights
     )
-    parser.add_argument(
+
+    latest_qe = max(garch_history.keys())
+    garch_current = garch_history[latest_qe]
+    hmm_current = hmm_result["history"][latest_qe]
+    bl_current = bl_result["current"]
+    bl_history = bl_result["history"]
+
+    fx_result = analyze_fx(data, current_weights)
+    stock_picks = run_screener(regime=hmm_current.get("regime", 1), data=data)
+
+    portfolio_value_usd = state.get("portfolio_value", 100_000.0) or 100_000.0
+    etf_prices = {
+        a: float(data[f"price_{a}"].iloc[-1]) for a in ASSETS if f"price_{a}" in data.columns
+    }
+    cost_result = compute_costs(
+        current_weights,
+        bl_current["optimal_weights"],
+        bl_current["bl_returns"],
+        portfolio_value_usd=portfolio_value_usd,
+        etf_prices=etf_prices,
+    )
+
+    strat_ret = _build_strategy_returns(garch_history, bl_history, data, include_tc=True)
+    bench_ret = _build_strategy_returns(
+        garch_history, bl_history, data, weights_override=BASE_WEIGHTS
+    )
+    current_w_ret = _build_strategy_returns(
+        garch_history, bl_history, data, weights_override=current_weights
+    )
+    vol_eval = compute_garch_vol_evaluation(garch_history, data)
+
+    print_report(
+        garch_current,
+        hmm_current,
+        market_regimes,
+        fx_result,
+        stock_picks,
+        ml_result["current_forecast"],
+        ml_result["next_quarter_forecast"],
+        bl_current,
+        cost_result,
+        current_weights,
+        bl_current["optimal_weights"],
+        strat_ret,
+        bench_ret,
+        current_w_ret,
+        vol_eval=vol_eval,
+    )
+    save_dashboard(
+        garch_history,
+        hmm_result,
+        bl_history,
+        ml_result,
+        market_regimes,
+        fx_result,
+        strat_ret,
+        bench_ret,
+        current_w_ret,
+    )
+
+
+# ── Subcommand: screen ────────────────────────────────────────────────────────
+
+
+def cmd_screen(regime: int = 1) -> None:
+    """Run the stock screener for a given regime and print + save picks."""
+    import csv
+
+    print("\n" + "=" * 60)
+    print(f"  STOCK SCREENER  (regime={regime}: 0=Bull / 1=Transition / 2=Crisis)")
+    print("=" * 60 + "\n")
+
+    data = fetch_data(force_refresh=False)
+    picks = run_screener(regime=regime, data=data)
+
+    regime_names = {0: "Bull", 1: "Transition", 2: "Crisis"}
+    print(f"  Top picks for {regime_names.get(regime, 'Unknown')} regime:\n")
+    for p in picks:
+        if p["ticker"] == "N/A":
+            print(f'    {p["note"]}')
+            break
+        ret_str = f'  ret_3m {p.get("ret_3m_pct", 0):+.1%}' if "ret_3m_pct" in p else ""
+        print(
+            f'  {p["rank"]}. {p["ticker"]:8s} {p["sector"]:22s} '
+            f'score {p["score"]:+.3f}  3m_z {p["mom_3m_z"]:+.3f}'
+            f'{ret_str}  — {p["note"]}'
+        )
+
+    # CSV output
+    results_dir = Path("results")
+    results_dir.mkdir(exist_ok=True)
+    csv_path = results_dir / "stock_picks.csv"
+    if picks and picks[0]["ticker"] != "N/A":
+        keys = list(picks[0].keys())
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=keys)
+            writer.writeheader()
+            writer.writerows(picks)
+        print(f"\n  Saved → {csv_path}")
+
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+LEGACY_FLAGS = {"--refresh", "--capital", "--portfolio-value", "--non-interactive"}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Portfolio Intelligence Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python main.py run --refresh          Full pipeline, force re-fetch + re-fit
+  python main.py run --non-interactive  Full pipeline, no interactive prompt
+  python main.py backtest               Focused backtest report + CSV artifacts
+  python main.py report                 Regenerate report from cached models
+  python main.py screen --regime 0      Stock picks for Bull regime
+        """,
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    # run
+    p_run = sub.add_parser("run", help="Full pipeline (default)")
+    p_run.add_argument("--refresh", action="store_true", help="Force re-fetch + re-fit all models")
+    p_run.add_argument("--capital", type=float, default=0.0, help="New capital to deploy (USD)")
+    p_run.add_argument(
         "--portfolio-value",
         type=float,
         default=100_000.0,
-        help="Total portfolio value in USD (for cost calculation)",
+        help="Total portfolio value (USD)",
     )
-    parser.add_argument(
+    p_run.add_argument(
         "--non-interactive",
         action="store_true",
-        help="Skip rebalance prompt and auto-save proposed weights",
+        help="Skip rebalance prompt, auto-save proposed weights",
     )
+
+    # backtest
+    p_bt = sub.add_parser("backtest", help="Focused backtest comparison + CSV output")
+    p_bt.add_argument("--refresh", action="store_true", help="Force re-fetch + re-fit")
+
+    # report
+    sub.add_parser("report", help="Regenerate dashboard/report from cached models")
+
+    # screen
+    p_sc = sub.add_parser("screen", help="Run stock screener")
+    p_sc.add_argument(
+        "--regime",
+        type=int,
+        default=1,
+        choices=[0, 1, 2],
+        help="Regime override: 0=Bull, 1=Transition, 2=Crisis (default: 1)",
+    )
+
+    return parser
+
+
+if __name__ == "__main__":
+    # ── Backward-compat: if first arg looks like a flag (not a subcommand), prepend "run" ──
+    known_cmds = {"run", "backtest", "report", "screen"}
+    if len(sys.argv) > 1 and sys.argv[1].startswith("-"):
+        sys.argv.insert(1, "run")
+
+    parser = _build_parser()
     args = parser.parse_args()
 
-    run(
-        force_refresh=args.refresh,
-        new_capital_usd=args.capital,
-        portfolio_value_usd=args.portfolio_value,
-        non_interactive=args.non_interactive,
-    )
+    if args.cmd == "run" or args.cmd is None:
+        run(
+            force_refresh=getattr(args, "refresh", False),
+            new_capital_usd=getattr(args, "capital", 0.0),
+            portfolio_value_usd=getattr(args, "portfolio_value", 100_000.0),
+            non_interactive=getattr(args, "non_interactive", False),
+        )
+    elif args.cmd == "backtest":
+        cmd_backtest(force_refresh=args.refresh)
+    elif args.cmd == "report":
+        cmd_report()
+    elif args.cmd == "screen":
+        cmd_screen(regime=args.regime)
+    else:
+        parser.print_help()

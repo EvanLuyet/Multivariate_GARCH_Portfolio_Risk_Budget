@@ -123,6 +123,88 @@ def _optimize_weights(mu: np.ndarray, Sigma_annual: np.ndarray, w_current: np.nd
     return w_opt, best_sharpe
 
 
+def _optimize_min_variance(Sigma_annual: np.ndarray) -> np.ndarray:
+    """Minimum-variance portfolio (no return input needed)."""
+
+    def port_var(w):
+        return float(w @ Sigma_annual @ w)
+
+    constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
+    w0 = np.array([b[0] for b in BOUNDS])
+    w0 = np.clip(w0 / w0.sum(), [b[0] for b in BOUNDS], [b[1] for b in BOUNDS])
+    w0 /= w0.sum()
+    res = minimize(
+        port_var,
+        w0,
+        method="SLSQP",
+        bounds=BOUNDS,
+        constraints=constraints,
+        options={"ftol": 1e-9, "maxiter": 500},
+    )
+    w_opt = np.clip(res.x if res.success else w0, 0.0, 1.0)
+    return w_opt / w_opt.sum()
+
+
+def _optimize_risk_parity(Sigma_annual: np.ndarray) -> np.ndarray:
+    """
+    Risk-parity (equal risk contribution) via SLSQP.
+    Objective: sum_i (RC_i - 1/n)² — minimise deviation from equal risk.
+    """
+    n = len(ASSETS)
+    target = 1.0 / n
+
+    def rp_objective(w):
+        port_var = float(w @ Sigma_annual @ w)
+        port_vol = np.sqrt(max(port_var, 1e-12))
+        mrc = Sigma_annual @ w / port_vol
+        rc = w * mrc / port_vol
+        return float(np.sum((rc - target) ** 2))
+
+    constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
+    w0 = W_BASE_ARR.copy()
+    res = minimize(
+        rp_objective,
+        w0,
+        method="SLSQP",
+        bounds=BOUNDS,
+        constraints=constraints,
+        options={"ftol": 1e-9, "maxiter": 1000},
+    )
+    w_opt = np.clip(res.x if res.success else w0, 0.0, 1.0)
+    return w_opt / w_opt.sum()
+
+
+def _optimize_max_return(
+    mu: np.ndarray, Sigma_annual: np.ndarray, vol_target: float = 0.12
+) -> np.ndarray:
+    """
+    Maximum expected return subject to annualised vol ≤ vol_target.
+    Falls back to max-Sharpe if the vol constraint is infeasible.
+    """
+    constraints = [
+        {"type": "eq", "fun": lambda w: w.sum() - 1.0},
+        {
+            "type": "ineq",
+            "fun": lambda w: vol_target - np.sqrt(max(float(w @ Sigma_annual @ w), 1e-12)),
+        },
+    ]
+    w0 = W_BASE_ARR.copy()
+    res = minimize(
+        lambda w: -float(w @ mu),
+        w0,
+        method="SLSQP",
+        bounds=BOUNDS,
+        constraints=constraints,
+        options={"ftol": 1e-9, "maxiter": 500},
+    )
+    if res.success:
+        w_opt = np.clip(res.x, 0.0, 1.0)
+        return w_opt / w_opt.sum()
+    # Fallback to max-Sharpe
+    w_opt, _ = _optimize_weights(mu, Sigma_annual, W_BASE_ARR)
+    return w_opt
+
+
 def _regime_blend(w_bl: np.ndarray, regime_probs: list) -> np.ndarray:
     """
     Soft blend: α = p_Bull×1.0 + p_Trans×0.5 + p_Crisis×0.25
@@ -183,6 +265,13 @@ def run_black_litterman(
         w_opt, sharpe = _optimize_weights(mu, Sigma_a, w_prev)
         w_final = _regime_blend(w_opt, hmm["regime_probs"])
 
+        # Alternative objectives (stored for comparison; not used by default)
+        w_minvar = _optimize_min_variance(Sigma_a)
+        w_rp = _optimize_risk_parity(Sigma_a)
+        from config import TARGET_VOL
+
+        w_maxret = _optimize_max_return(mu, Sigma_a, vol_target=TARGET_VOL)
+
         history[qe] = dict(
             optimal_weights={a: float(w_final[i]) for i, a in enumerate(ASSETS)},
             raw_bl_weights={a: float(w_opt[i]) for i, a in enumerate(ASSETS)},
@@ -191,6 +280,9 @@ def run_black_litterman(
             sharpe_ratio=float(sharpe),
             regime=hmm["regime"],
             regime_label=hmm["regime_label"],
+            min_variance_weights={a: float(w_minvar[i]) for i, a in enumerate(ASSETS)},
+            risk_parity_weights={a: float(w_rp[i]) for i, a in enumerate(ASSETS)},
+            max_return_weights={a: float(w_maxret[i]) for i, a in enumerate(ASSETS)},
         )
         w_prev = w_final.copy()
 

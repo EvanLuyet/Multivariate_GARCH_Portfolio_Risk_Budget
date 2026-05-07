@@ -186,6 +186,8 @@ def _compute_factors(prices: pd.DataFrame) -> pd.DataFrame:
                 mom_6m=mom_6m,
                 sharpe=sharpe,
                 low_dd=-mdd,
+                # Raw 3m log return (not normalised) — kept for display / CSV
+                ret_3m_raw=float(r.iloc[-63:].sum()),
             )
         )
 
@@ -194,7 +196,7 @@ def _compute_factors(prices: pd.DataFrame) -> pd.DataFrame:
 
     df = pd.DataFrame(rows).set_index("ticker")
 
-    # Z-score normalise each factor across the universe
+    # Z-score normalise each factor across the universe (ret_3m_raw is kept un-normalised)
     for col in ["mom_1m", "mom_3m", "mom_6m", "sharpe", "low_dd"]:
         mu = df[col].mean()
         std = df[col].std()
@@ -259,7 +261,8 @@ def run_screener(regime: int, data: pd.DataFrame) -> list:
                 ticker=ticker,
                 sector=SECTOR_MAP.get(ticker, "Large Cap"),
                 score=round(float(row["score"]), 3),
-                mom_3m_z=round(float(row["mom_3m"]), 3),  # normalised z-score (not raw %)
+                mom_3m_z=round(float(row["mom_3m"]), 3),  # normalised z-score
+                ret_3m_pct=round(float(row.get("ret_3m_raw", 0.0)), 4),  # raw log return
                 sharpe_z=round(float(row["sharpe"]), 2),
                 note=note,
             )
