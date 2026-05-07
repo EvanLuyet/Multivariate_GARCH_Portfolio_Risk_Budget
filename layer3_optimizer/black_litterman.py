@@ -126,7 +126,8 @@ def run_black_litterman(garch_history: dict, hmm_history: dict,
 
         ml = ml_history.get(qe, {}).get('return_forecasts')
         if ml is not None:
-            Q  = np.array([ml[a]['point'] * 4.0 for a in ASSETS])
+            # Use bl_point (XGB conditional mean) for BL views; fall back to q50
+            Q  = np.array([ml[a].get('bl_point', ml[a]['point']) * 4.0 for a in ASSETS])
             mu = _bl_posterior(Pi, Sigma_a, Q)
         else:
             mu = Pi.copy()
