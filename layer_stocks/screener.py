@@ -25,6 +25,7 @@ Data is cached for 1 day alongside the main data cache.
 
 import sys
 import time
+import logging
 import warnings
 import numpy as np
 import pandas as pd
@@ -33,29 +34,48 @@ import yfinance as yf
 from pathlib import Path
 from datetime import datetime, timedelta
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
+
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from config import STOCK_UNIVERSE, MODEL_CACHE_DIR, TRADING_DAYS, RISK_FREE_RATE
+from config import STOCK_UNIVERSE, MODEL_CACHE_DIR, TRADING_DAYS, RISK_FREE_RATE, CONFIG_HASH
 
 # Per-regime factor weights: [mom_1m, mom_3m, mom_6m, sharpe, low_dd]
 REGIME_WEIGHTS = {
-    0: np.array([0.25, 0.35, 0.20, 0.15, 0.05]),   # Bull — momentum heavy
-    1: np.array([0.15, 0.30, 0.20, 0.25, 0.10]),   # Transition — balanced
-    2: np.array([0.05, 0.15, 0.15, 0.25, 0.40]),   # Crisis — defensives
+    0: np.array([0.25, 0.35, 0.20, 0.15, 0.05]),  # Bull — momentum heavy
+    1: np.array([0.15, 0.30, 0.20, 0.25, 0.10]),  # Transition — balanced
+    2: np.array([0.05, 0.15, 0.15, 0.25, 0.40]),  # Crisis — defensives
 }
 
 # Sector tags for display (best-effort, not comprehensive)
 SECTOR_MAP = {
-    'AAPL': 'Technology', 'MSFT': 'Technology', 'NVDA': 'Technology',
-    'GOOGL': 'Technology', 'AMZN': 'Consumer', 'META': 'Technology',
-    'BRK-B': 'Financials', 'JPM': 'Financials', 'JNJ': 'Healthcare',
-    'XOM': 'Energy', 'UNH': 'Healthcare', 'V': 'Financials',
-    'MA': 'Financials', 'AVGO': 'Technology', 'PG': 'Consumer Staples',
-    'HD': 'Consumer', 'COST': 'Consumer Staples', 'LLY': 'Healthcare',
-    'ASML': 'Technology (EU)', 'NVO': 'Healthcare (EU)', 'SAP': 'Technology (EU)',
-    'AZN': 'Healthcare (EU)', 'SHEL': 'Energy (EU)', 'TTE': 'Energy (EU)',
-    'UBS': 'Financials (CH)', 'ABB': 'Industrials (CH)',
+    "AAPL": "Technology",
+    "MSFT": "Technology",
+    "NVDA": "Technology",
+    "GOOGL": "Technology",
+    "AMZN": "Consumer",
+    "META": "Technology",
+    "BRK-B": "Financials",
+    "JPM": "Financials",
+    "JNJ": "Healthcare",
+    "XOM": "Energy",
+    "UNH": "Healthcare",
+    "V": "Financials",
+    "MA": "Financials",
+    "AVGO": "Technology",
+    "PG": "Consumer Staples",
+    "HD": "Consumer",
+    "COST": "Consumer Staples",
+    "LLY": "Healthcare",
+    "ASML": "Technology (EU)",
+    "NVO": "Healthcare (EU)",
+    "SAP": "Technology (EU)",
+    "AZN": "Healthcare (EU)",
+    "SHEL": "Energy (EU)",
+    "TTE": "Energy (EU)",
+    "UBS": "Financials (CH)",
+    "ABB": "Industrials (CH)",
 }
 
 
@@ -64,14 +84,14 @@ def _extract_close(raw: pd.DataFrame, tickers: list) -> pd.DataFrame:
     if isinstance(raw.columns, pd.MultiIndex):
         lvl0 = raw.columns.get_level_values(0).unique().tolist()
         lvl1 = raw.columns.get_level_values(1).unique().tolist()
-        for label in ('Close', 'Price', 'Adj Close'):
+        for label in ("Close", "Price", "Adj Close"):
             if label in lvl0:
                 return raw[label]
             if label in lvl1:
                 return raw.xs(label, axis=1, level=1)
         return raw[lvl0[0]]
-    if 'Close' in raw.columns:
-        out = raw[['Close']]
+    if "Close" in raw.columns:
+        out = raw[["Close"]]
         if len(tickers) == 1:
             out.columns = tickers
         return out
@@ -86,19 +106,20 @@ def _fetch_stock_data(tickers: list, lookback_days: int = 180) -> pd.DataFrame:
     to stay within Yahoo Finance rate limits.
     Falls back to per-ticker download for any batch that fails.
     """
-    end   = datetime.today().strftime('%Y-%m-%d')
-    start = (datetime.today() - timedelta(days=lookback_days + 30)).strftime('%Y-%m-%d')
+    end = datetime.today().strftime("%Y-%m-%d")
+    start = (datetime.today() - timedelta(days=lookback_days + 30)).strftime("%Y-%m-%d")
 
     frames = []
     n_batches = (len(tickers) + 4) // 5
     for i in range(0, len(tickers), 5):
-        batch = tickers[i:i + 5]
+        batch = tickers[i : i + 5]
         batch_num = i // 5 + 1
         try:
-            raw = yf.download(batch, start=start, end=end,
-                              auto_adjust=True, progress=False, threads=False)
+            raw = yf.download(
+                batch, start=start, end=end, auto_adjust=True, progress=False, threads=False
+            )
             if raw.empty:
-                print(f'  Screener batch {batch_num}/{n_batches} empty — skipping {batch}')
+                print(f"  Screener batch {batch_num}/{n_batches} empty — skipping {batch}")
             else:
                 chunk = _extract_close(raw, batch)
                 if isinstance(chunk, pd.Series):
@@ -106,17 +127,20 @@ def _fetch_stock_data(tickers: list, lookback_days: int = 180) -> pd.DataFrame:
                 elif len(batch) == 1 and chunk.shape[1] == 1:
                     chunk.columns = batch
                 frames.append(chunk)
-                print(f'  Screener batch {batch_num}/{n_batches} OK '
-                      f'({chunk.shape[1]} tickers, {chunk.shape[0]} rows)')
+                print(
+                    f"  Screener batch {batch_num}/{n_batches} OK "
+                    f"({chunk.shape[1]} tickers, {chunk.shape[0]} rows)"
+                )
         except Exception as exc:
-            print(f'  Screener batch {batch_num}/{n_batches} failed: {exc}')
+            print(f"  Screener batch {batch_num}/{n_batches} failed: {exc}")
             # Per-ticker fallback for the failed batch
             for ticker in batch:
                 try:
-                    t_raw = yf.download(ticker, start=start, end=end,
-                                        auto_adjust=True, progress=False)
-                    if not t_raw.empty and 'Close' in t_raw.columns:
-                        frames.append(t_raw[['Close']].rename(columns={'Close': ticker}))
+                    t_raw = yf.download(
+                        ticker, start=start, end=end, auto_adjust=True, progress=False
+                    )
+                    if not t_raw.empty and "Close" in t_raw.columns:
+                        frames.append(t_raw[["Close"]].rename(columns={"Close": ticker}))
                 except Exception:
                     pass
         time.sleep(1.0)
@@ -125,7 +149,7 @@ def _fetch_stock_data(tickers: list, lookback_days: int = 180) -> pd.DataFrame:
         return pd.DataFrame()
     result = pd.concat(frames, axis=1)
     # Drop columns that are entirely NaN (tickers that never downloaded)
-    result = result.dropna(axis=1, how='all')
+    result = result.dropna(axis=1, how="all")
     return result
 
 
@@ -143,27 +167,36 @@ def _compute_factors(prices: pd.DataFrame) -> pd.DataFrame:
         mom_3m = float(r.iloc[-63:].sum())
         mom_6m = float(r.iloc[-126:].sum()) if len(r) >= 126 else mom_3m
 
-        vol_6m = float(r.iloc[-126:].std() * np.sqrt(TRADING_DAYS)) if len(r) >= 126 else \
-                 float(r.std() * np.sqrt(TRADING_DAYS))
+        vol_6m = (
+            float(r.iloc[-126:].std() * np.sqrt(TRADING_DAYS))
+            if len(r) >= 126
+            else float(r.std() * np.sqrt(TRADING_DAYS))
+        )
         ann_ret_6m = mom_6m * (TRADING_DAYS / 126)
         sharpe = (ann_ret_6m - RISK_FREE_RATE) / (vol_6m + 1e-8)
 
         cum = (1 + r.iloc[-126:]).cumprod()
         mdd = float(((cum - cum.cummax()) / cum.cummax()).min()) if len(cum) > 0 else 0.0
 
-        rows.append(dict(
-            ticker=ticker, mom_1m=mom_1m, mom_3m=mom_3m,
-            mom_6m=mom_6m, sharpe=sharpe, low_dd=-mdd,
-        ))
+        rows.append(
+            dict(
+                ticker=ticker,
+                mom_1m=mom_1m,
+                mom_3m=mom_3m,
+                mom_6m=mom_6m,
+                sharpe=sharpe,
+                low_dd=-mdd,
+            )
+        )
 
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).set_index('ticker')
+    df = pd.DataFrame(rows).set_index("ticker")
 
     # Z-score normalise each factor across the universe
-    for col in ['mom_1m', 'mom_3m', 'mom_6m', 'sharpe', 'low_dd']:
-        mu  = df[col].mean()
+    for col in ["mom_1m", "mom_3m", "mom_6m", "sharpe", "low_dd"]:
+        mu = df[col].mean()
         std = df[col].std()
         df[col] = (df[col] - mu) / (std + 1e-8)
 
@@ -182,19 +215,19 @@ def run_screener(regime: int, data: pd.DataFrame) -> list:
     Returns
     -------
     List of dicts, each with:
-        rank, ticker, sector, score, mom_3m_pct, sharpe, regime_fit, note
+        rank, ticker, sector, score, mom_3m_z, sharpe_z, note
     """
-    cache_dir  = Path(MODEL_CACHE_DIR)
+    cache_dir = Path(MODEL_CACHE_DIR)
     cache_dir.mkdir(exist_ok=True)
-    cache_file = cache_dir / f'screener_{datetime.today().strftime("%Y%m%d")}.joblib'
+    cache_file = cache_dir / f'screener_{CONFIG_HASH}_{datetime.today().strftime("%Y%m%d")}.joblib'
 
     if cache_file.exists():
         cached = joblib.load(cache_file)
         # Invalidate if regime has changed since last cache
-        if cached.get('regime') == regime:
-            return cached['picks']
+        if cached.get("regime") == regime:
+            return cached["picks"]
 
-    print('Layer Stocks — Running stock screener …')
+    logger.info("Layer Stocks — Running stock screener …")
 
     prices = _fetch_stock_data(STOCK_UNIVERSE)
     if prices.empty:
@@ -204,50 +237,62 @@ def run_screener(regime: int, data: pd.DataFrame) -> list:
     if factors.empty:
         return _fallback_picks()
 
-    w      = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS[1])
-    cols   = ['mom_1m', 'mom_3m', 'mom_6m', 'sharpe', 'low_dd']
+    w = REGIME_WEIGHTS.get(regime, REGIME_WEIGHTS[1])
+    cols = ["mom_1m", "mom_3m", "mom_6m", "sharpe", "low_dd"]
     scores = factors[cols].values @ w
-    factors['score'] = scores
+    factors["score"] = scores
 
-    top5  = factors.nlargest(5, 'score')
+    top5 = factors.nlargest(5, "score")
     picks = []
     for rank, (ticker, row) in enumerate(top5.iterrows(), 1):
         # Regime fit description
         if regime == 0:
-            note = 'Strong momentum in Bull market'
+            note = "Strong momentum in Bull market"
         elif regime == 1:
-            note = 'Quality/balanced profile for Transition'
+            note = "Quality/balanced profile for Transition"
         else:
-            note = 'Defensive characteristics for Crisis regime'
+            note = "Defensive characteristics for Crisis regime"
 
-        picks.append(dict(
-            rank       = rank,
-            ticker     = ticker,
-            sector     = SECTOR_MAP.get(ticker, 'Large Cap'),
-            score      = round(float(row['score']), 3),
-            mom_3m_pct = round(float(row['mom_3m']) * 100, 1),  # normalised z-score × 100
-            sharpe_z   = round(float(row['sharpe']), 2),
-            note       = note,
-        ))
+        picks.append(
+            dict(
+                rank=rank,
+                ticker=ticker,
+                sector=SECTOR_MAP.get(ticker, "Large Cap"),
+                score=round(float(row["score"]), 3),
+                mom_3m_z=round(float(row["mom_3m"]), 3),  # normalised z-score (not raw %)
+                sharpe_z=round(float(row["sharpe"]), 2),
+                note=note,
+            )
+        )
 
-    joblib.dump({'regime': regime, 'picks': picks}, cache_file)
+    joblib.dump({"regime": regime, "picks": picks}, cache_file)
     return picks
 
 
 def _fallback_picks() -> list:
     """Return placeholder when data download fails."""
-    return [dict(rank=i, ticker='N/A', sector='N/A', score=0,
-                 mom_3m_pct=0, sharpe_z=0,
-                 note='Stock data unavailable — check internet connection')
-            for i in range(1, 6)]
+    return [
+        dict(
+            rank=i,
+            ticker="N/A",
+            sector="N/A",
+            score=0,
+            mom_3m_z=0,
+            sharpe_z=0,
+            note="Stock data unavailable — check internet connection",
+        )
+        for i in range(1, 6)
+    ]
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     from data.fetcher import fetch_data
 
-    df    = fetch_data()
+    df = fetch_data()
     picks = run_screener(regime=0, data=df)
-    print('\nTop 5 stocks (Bull regime):')
+    print("\nTop 5 stocks (Bull regime):")
     for p in picks:
-        print(f"  {p['rank']}. {p['ticker']:8s} {p['sector']:20s} "
-              f"score={p['score']:+.2f}  3m={p['mom_3m_pct']:+.1f}z  {p['note']}")
+        print(
+            f"  {p['rank']}. {p['ticker']:8s} {p['sector']:20s} "
+            f"score={p['score']:+.2f}  3m_z={p['mom_3m_z']:+.3f}  {p['note']}"
+        )
